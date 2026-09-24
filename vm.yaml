@@ -38,9 +38,7 @@ user:
 
 param:
   ProxyPort: {{proxy_port}}
-  Upstream: {{upstream}}
   Packages: {{packages}}
-  User: {{user}}
 
 provision:
 - mode: system
