@@ -1,143 +1,32 @@
-# ssbx: a Colima VM whose only way out is mitmproxy running on YOUR machine.
-# You start the proxy yourself (see README); the VM trusts its CA, points
-# every tool at it and refuses any other route out, containers included.
-# Incus inside is unrestricted: root, any container, whatever you like.
+# ssbx: a Colima VM whose traffic is captured on your Mac by mitmproxy in
+# local mode (see README). Nothing in the VM knows about the proxy; the VM
+# only has to trust the proxy's CA, which the script below does.
 #
-#   mitmproxy --set confdir=~/.config/ssbx      # on your machine, keep it running
-#   colima start ssbx
-#
-# Every Colima setting is listed; the ones that matter for ssbx are commented.
-# Linux: `colima start ssbx --vm-type qemu --mount-type 9p` (virtiofs is macOS only).
+#   mkdir -p ~/sandbox ~/.config/ssbx ~/.colima/ssbx
+#   cp config.yaml ~/.config/ssbx/ && cp colima.yaml ~/.colima/ssbx/
+#   mitmproxy --set confdir=~/.config/ssbx      # terminal 1
+#   colima start ssbx                           # terminal 2
 
 cpu: 4
-disk: 60                     # GiB for containers and images; can only grow later
-memory: 3                    # GiB for the VM
-arch: host
-runtime: incus               # containers inside are Incus, not Docker
-modelRunner: docker          # unused with incus, Colima's default
-hostname: ""                 # default: colima-ssbx
-kubernetes:
-  enabled: false
-autoActivate: true           # makes `incus` on your machine talk to this VM
-
+memory: 3
+disk: 60
+runtime: incus
+vmType: vz
+mountType: virtiofs
 network:
-  address: false             # the VM needs no reachable IP
-  mode: shared
-  interface: en0
-  preferredRoute: false
-  dns: []
-  dnsHosts: {}
-  hostAddresses: false
-  gatewayAddress: 192.168.5.2   # your machine as seen from the VM; the proxy lives there
+  address: false          # keep false: a reachable IP would bypass the proxy (vzNAT)
+forwardAgent: false
+sshConfig: false
 
-forwardAgent: false          # never hand the sandbox your SSH agent
-docker: {}
-vmType: vz                   # Linux: qemu
-portForwarder: ssh
-rosetta: false               # no amd64 binaries in the sandbox
-binfmt: false                # no foreign-architecture emulation needed
-nestedVirtualization: false  # only needed for Incus VMs, not containers
-mountType: virtiofs          # Linux: 9p
-mountInotify: false
-cpuType: host
-sshConfig: false             # do not write into ~/.ssh/config; `colima ssh ssbx` still works
-sshPort: 0
-diskImage: ""
-forceDiskImage: false
-rootDisk: 20
-env: {}
-
-# Folders the VM and the container see, at the same paths as on your machine.
-# ~/sandbox: your projects. ~/.claude: Claude Code login, settings, skills.
-# ~/.config/ssbx: mitmproxy's folder (config.yaml and its CA), read-only.
 mounts:
-  - location: ~/sandbox
+  - location: ~/sandbox   # your projects
     writable: true
-  - location: ~/.claude
+  - location: ~/.claude   # Claude Code login, settings, skills
     writable: true
-  - location: ~/.config/ssbx
-    writable: false
-# - location: ~/.codex
-#   writable: true
 
 provision:
-  # As root, every start. The proxy must be running on your machine already.
+  # Trust the proxy's CA. http://mitm.it is answered by mitmproxy itself.
   - mode: system
     script: |
-      set -eu
-      P=http://192.168.5.2:8080
-      CFG=$(findmnt -rn -o TARGET | grep '/\.config/ssbx$' | head -1)
-      USER_UID=$(id -u "$(basename "$(ls -d /home/*.linux | head -1)" .linux)")
-      # 1. trust the proxy's CA (mitmproxy writes it into its confdir on first run)
-      cp "$CFG/mitmproxy-ca-cert.pem" /usr/local/share/ca-certificates/ssbx.crt
+      until curl -sf http://mitm.it/cert/pem -o /usr/local/share/ca-certificates/ssbx.crt; do sleep 3; done
       update-ca-certificates >/dev/null
-      # 2. point everything in the VM at the proxy
-      printf 'export HTTP_PROXY=%s HTTPS_PROXY=%s http_proxy=%s https_proxy=%s\n' $P $P $P $P > /etc/profile.d/ssbx.sh
-      printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' $P $P > /etc/apt/apt.conf.d/90ssbx
-      printf 'Defaults env_keep += "HTTP_PROXY HTTPS_PROXY http_proxy https_proxy"\n' > /etc/sudoers.d/ssbx
-      command -v nft >/dev/null || { apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -yq nftables; }
-      # 3. the only way out, for the VM and for every container in it: the proxy
-      #    (plus the VM's own DNS server, names only). Everything else is refused.
-      nft delete table inet ssbx 2>/dev/null || true
-      nft -f - <<NFT
-      table inet ssbx {
-        chain out { type filter hook output priority 0; policy drop;
-          oif lo accept
-          ct state established,related accept
-          ip daddr 192.168.5.2 tcp dport 8080 accept
-          ip daddr 192.168.5.3 udp dport 53 accept
-          reject
-        }
-        chain fwd { type filter hook forward priority 0; policy drop;
-          ct state established,related accept
-          ip daddr 192.168.5.2 tcp dport 8080 accept
-          reject
-        }
-      }
-      NFT
-      # 4. let Incus run containers as you (your uid inside = your uid on the files)
-      for f in /etc/subuid /etc/subgid; do
-        grep -q "^root:$USER_UID:1$" "$f" || echo "root:$USER_UID:1" >> "$f"
-      done
-      systemctl try-restart incus.service || true
-
-  # Once Incus is up: image downloads through the proxy, and a container
-  # `ssbx` that already trusts the proxy, with a user like you inside.
-  - mode: ready
-    script: |
-      set -eu
-      P=http://192.168.5.2:8080
-      CFG=$(findmnt -rn -o TARGET | grep '/\.config/ssbx$' | head -1)
-      HOME_DIR=${CFG%/.config/ssbx}
-      USER_NAME=$(basename "$HOME_DIR")
-      USER_UID=$(id -u "$(basename "$(ls -d /home/*.linux | head -1)" .linux)")
-      for i in $(seq 60); do sudo -n incus info >/dev/null 2>&1 && break; sleep 2; done
-      sudo -n incus config set core.proxy_http=$P core.proxy_https=$P
-      sudo -n incus profile show ssbx >/dev/null 2>&1 || sudo -n incus profile create ssbx
-      sudo -n incus profile edit ssbx <<EOF
-      description: ssbx sandbox
-      config:
-        boot.autostart: "true"
-        raw.idmap: "both $USER_UID $USER_UID"
-        environment.HTTP_PROXY: $P
-        environment.HTTPS_PROXY: $P
-        environment.http_proxy: $P
-        environment.https_proxy: $P
-      devices:
-        sandbox: {type: disk, source: $HOME_DIR/sandbox, path: $HOME_DIR/sandbox, shift: "true"}
-        claude: {type: disk, source: $HOME_DIR/.claude, path: $HOME_DIR/.claude, shift: "true"}
-      EOF
-      if sudo -n incus info ssbx >/dev/null 2>&1; then sudo -n incus start ssbx 2>/dev/null || true; exit 0; fi
-      sudo -n incus launch images:debian/13 ssbx -p default -p ssbx
-      sudo -n incus file push "$CFG/mitmproxy-ca-cert.pem" ssbx/usr/local/share/ca-certificates/ssbx.crt
-      cat > /tmp/ssbx-setup.sh <<EOF
-      set -eu
-      update-ca-certificates >/dev/null
-      printf 'Acquire::http::Proxy "$P";\nAcquire::https::Proxy "$P";\n' > /etc/apt/apt.conf.d/90ssbx
-      apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -yq sudo git curl ca-certificates
-      useradd -u $USER_UID -d $HOME_DIR -s /bin/bash $USER_NAME && chown $USER_UID:$USER_UID $HOME_DIR
-      printf '$USER_NAME ALL=(ALL) NOPASSWD:ALL\nDefaults env_keep += "HTTP_PROXY HTTPS_PROXY http_proxy https_proxy"\n' > /etc/sudoers.d/ssbx
-      printf 'export HTTP_PROXY=$P HTTPS_PROXY=$P http_proxy=$P https_proxy=$P\n' > /etc/profile.d/ssbx.sh
-      EOF
-      sudo -n incus file push /tmp/ssbx-setup.sh ssbx/root/ssbx-setup.sh
-      sudo -n incus exec ssbx -- sh /root/ssbx-setup.sh

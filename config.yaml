@@ -1,6 +1,11 @@
-# This is mitmproxy's own config file (mitmdump --set confdir=<dir> reads
-# it as <dir>/config.yaml). No custom code: the allowlist below is plain
+# This is mitmproxy's own config file (mitmproxy --set confdir=<dir> reads it
+# as <dir>/config.yaml). No custom code: the allowlist below is plain
 # mitmproxy options.
+#
+# mode local:limactl captures every connection made by the process
+# "limactl" on your Mac: that is Lima's host agent, which carries all of the
+# Colima VM's traffic (containers included). Nothing inside the VM can go
+# around it, and nothing inside needs a proxy setting.
 #
 # block_list holds ONE rule: a filter matching everything NOT allowed, so
 # it reads "block everything except (...)". Filters: ~d "regex" is the
@@ -14,27 +19,28 @@
 # needed (examples below). Restart mitmproxy after editing. A blocked
 # request gets a plain 403 and shows up red in mitmproxy's list.
 
-listen_host: 127.0.0.1   # the VM reaches it through Colima's gateway (192.168.5.2)
-listen_port: 8080
+mode:
+- local:limactl
 connection_strategy: lazy
 upstream_cert: false
 rawtcp: false
 termlog_verbosity: warn
+# A corporate upstream proxy: add it as a second mode entry above,
+# "- upstream:http://proxy:3128".
 
-# A corporate upstream proxy for all of ssbx's own traffic:
-#mode: upstream:http://proxy:3128
-
-# The allowlist. api.anthropic.com: any method. archive/security.ubuntu.com
-# (the VM's apt) and images.linuxcontainers.org (Incus images): GET/HEAD.
-# deb.debian.org and security.debian.org: GET/HEAD (apt in the container).
-# registry.npmjs.org: GET (npm).
+# The allowlist. mitm.it: mitmproxy's own page that hands out its CA
+# (never leaves the proxy). api.anthropic.com: any method.
+# archive/security.ubuntu.com (the VM's apt) and images.linuxcontainers.org
+# (Incus images): GET/HEAD. deb.debian.org and security.debian.org: GET/HEAD
+# (apt in a container). registry.npmjs.org: GET (npm).
 # pypi.org and files.pythonhosted.org: GET (pip). github.com: GET/HEAD
 # plus the POST that git clone/fetch needs (git-upload-pack) - so
 # ordinary reads and clones work, but push (git-receive-pack) does not.
 block_list:
 - >-
   ;!(
-  ~d "^api\.anthropic\.com$"
+  ~d "^mitm\.it$"
+  | ~d "^api\.anthropic\.com$"
   | ( ~d "^(archive\.ubuntu\.com|security\.ubuntu\.com|images\.linuxcontainers\.org)$" & ~m "^(GET|HEAD)$" )
   | ( ~d "^(deb\.debian\.org|security\.debian\.org)$" & ~m "^(GET|HEAD)$" )
   | ( ~d "^registry\.npmjs\.org$" & ~m "^GET$" )
