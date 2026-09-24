@@ -1,0 +1,58 @@
+# ssbx configuration. Copy this file to ~/.config/ssbx/config and change what
+# you need; every setting has a default, so an empty file is fine too.
+#
+# The file is read by bash. Strings go in quotes, lists in parentheses.
+
+
+# A proxy for everything that leaves the sandbox: Anthropic, npm, PyPI, and
+# the hosts from your hosts file. http://host:port or http://user:pass@host:port.
+# For a proxy running on your own machine write host.docker.internal instead
+# of localhost. Empty: no proxy. If HTTPS_PROXY is set in your shell, that is
+# the default.
+#proxy="http://host.docker.internal:1080"
+
+# The folders of your machine the VM is allowed to see. The sandbox itself
+# gets only the project you start ssbx in, which has to be inside one of them.
+# Your home directory by default. Changing this needs `ssbx stop`.
+#mounts=("$HOME")
+
+# Size of the VM. Changing these needs `ssbx stop`.
+#cpus=4
+#memory=8    # GiB
+#disk=60     # GiB
+
+# What the sandbox takes from your ~/.claude every time it starts. Each item
+# replaces its counterpart inside. Sessions, history and the login are never
+# taken, the sandbox has its own.
+#sync=(settings.json CLAUDE.md skills agents commands rules hooks output-styles themes keybindings.json plugins)
+
+# Also take the MCP servers from ~/.claude.json, with whatever keys and tokens
+# they carry.
+#sync_mcp=true
+
+# Also copy your login (~/.claude/.credentials.json) into the sandbox, so you
+# do not have to log in there. Linux only: on macOS the login lives in the
+# Keychain. Off by default because both sides may then refresh the same
+# token; if one of them gets logged out, turn this off and log in again.
+#sync_login=false
+
+# How Claude Code inside the sandbox handles permissions: bypassPermissions,
+# auto, acceptEdits or default. Empty: the same as on your machine.
+#permission_mode="bypassPermissions"
+
+# Extra environment variables for the sandbox, one "NAME=value" per item.
+#env=("ANTHROPIC_MODEL=claude-opus-5-5")
+
+# Extra Debian packages for the sandbox image. Applied by `ssbx rebuild`.
+#packages=(build-essential golang)
+
+# Extra options for the `docker run` that starts the sandbox.
+#docker_options=(--memory 4g)
+
+# The audit log: what the agent did and what was refused, one JSON object per
+# line. See `ssbx logs`.
+#log_file="$HOME/.local/state/ssbx/audit.jsonl"
+
+# What goes into it: "all" (every tool call and prompt) or "blocked" (only
+# refusals and failures; the proxy's blocks are always in).
+#log="all"

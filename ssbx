@@ -1,0 +1,538 @@
+#!/usr/bin/env bash
+#
+# ssbx: open a sandbox shell in the current project.
+#
+# Usage:
+#   ssbx                 bash inside the sandbox, in this directory
+#   ssbx claude          run one command inside instead (ssbx -- cmd if cmd is a word below)
+#   ssbx logs            the audit log, live: what the agent did, what was refused
+#   ssbx logs blocked    only the refusals and failures
+#   ssbx status          is the VM running, are the images built, where is everything
+#   ssbx reload          stop the proxy; it starts again with the current settings on your next ssbx
+#   ssbx rebuild         rebuild the images from scratch (this also updates Claude Code)
+#   ssbx stop            stop the VM (needed after changing mounts, cpus, memory, disk)
+#
+# How it works: a Colima VM runs two containers. The sandbox container gets the
+# project you started it in, and nothing else. Its only way out is the proxy
+# container, which keeps your tokens, lets only read requests through to
+# GitLab, Jira and the other hosts in your hosts file, and writes the audit
+# log. Settings come from ~/.config/ssbx/config (see config.example).
+#
+# Works with the bash that ships with macOS (3.2) and with Linux.
+
+set -euo pipefail
+
+
+# ------------------------------------------------------------- settings
+#
+# Defaults. ~/.config/ssbx/config overrides them; config.example explains each.
+
+proxy="${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}"
+mounts=("$HOME")
+cpus=4
+memory=8
+disk=60
+sync=(settings.json CLAUDE.md skills agents commands rules hooks output-styles themes keybindings.json plugins)
+sync_mcp=true
+sync_login=false
+permission_mode=""
+env=()
+packages=()
+docker_options=()
+log_file="$HOME/.local/state/ssbx/audit.jsonl"
+log="all"
+
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ssbx"
+config_file="$config_dir/config"
+hosts_file="$config_dir/hosts"
+
+if [ -f "$config_file" ]; then
+  # shellcheck disable=SC1090
+  . "$config_file"
+fi
+
+# A proxy on "localhost" is on your machine; from inside the VM that name is
+# host.docker.internal. Only the host part of the URL is touched. Colima itself
+# runs on your machine and gets the address as you wrote it.
+proxy_on_host="$proxy"
+if [ -n "$proxy" ]; then
+  proxy_rest="${proxy#*://}"
+  proxy_scheme="${proxy%%"$proxy_rest"}"
+  proxy_hostport="${proxy_rest##*@}"
+  proxy_userinfo="${proxy_rest%"$proxy_hostport"}"
+  proxy_hostport="${proxy_hostport/#127.0.0.1/host.docker.internal}"
+  proxy_hostport="${proxy_hostport/#localhost/host.docker.internal}"
+  proxy="$proxy_scheme$proxy_userinfo$proxy_hostport"
+fi
+
+# The audit log, the drop-in with the permission mode and a note of how the VM
+# was started live here. The proxy container writes the log to this folder.
+state_dir="$(dirname "$log_file")"
+log_name="$(basename "$log_file")"
+
+# Names of the Colima VM and of the Docker context Colima creates for it. The
+# containers, images, network and volume inside are all called ssbx too.
+profile="ssbx"
+context="colima-ssbx"
+
+# Where this script (and the Dockerfile next to it) really lives. ~/.local/bin/ssbx
+# is usually a symlink; readlink -f does not exist on older macOS.
+self="$0"
+while [ -L "$self" ]; do
+  target="$(readlink "$self")"
+  case "$target" in
+    /*) self="$target" ;;
+    *) self="$(dirname "$self")/$target" ;;
+  esac
+done
+script_dir="$(cd "$(dirname "$self")" && pwd -P)"
+
+docker() { command docker --context "$context" "$@"; }
+
+die() { echo "ssbx: $*" >&2; exit 1; }
+
+vm_state() {
+  { colima list 2>/dev/null || true; } | awk -v p="$profile" '$1 == p { print $2 }'
+}
+
+for tool in colima docker; do
+  command -v "$tool" >/dev/null 2>&1 || die "$tool is not installed (see the README)"
+done
+
+# On Linux, run QEMU without io_uring: QEMU 10.2 and later crash under network
+# load with the network device Lima uses. See lib/qemu-no-io-uring.
+if [ "$(uname -s)" = Linux ]; then
+  if command -v python3 >/dev/null 2>&1; then
+    export QEMU_SYSTEM_X86_64="$script_dir/lib/qemu-no-io-uring"
+    export QEMU_SYSTEM_AARCH64="$script_dir/lib/qemu-no-io-uring"
+  else
+    echo "ssbx: python3 is missing, so QEMU runs as it is; it may crash under network load (see lib/qemu-no-io-uring)" >&2
+  fi
+fi
+
+
+# ------------------------------------------------------------- commands
+#
+# Commands that do not need a project. `ssbx -- logs` runs a program called
+# logs inside instead.
+
+command=""
+case "${1:-}" in
+  -h | --help | help)
+    sed -n '3,14p' "$self" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+
+  stop)
+    colima stop --profile "$profile"
+    exit 0
+    ;;
+
+  status)
+    state="$(vm_state)"
+    echo "vm:       ${state:-not created}"
+    if [ "$state" = Running ]; then
+      for image in ssbx-proxy ssbx; do
+        if docker image inspect "$image" >/dev/null 2>&1; then
+          echo "image:    $image, built $(docker image inspect --format '{{.Created}}' "$image" | cut -c1-19)"
+        else
+          echo "image:    $image, not built"
+        fi
+      done
+      if docker container inspect ssbx-proxy >/dev/null 2>&1; then
+        echo "proxy:    $(docker container inspect --format '{{.State.Status}}' ssbx-proxy)"
+      else
+        echo "proxy:    not running"
+      fi
+    fi
+    echo "config:   $config_file$([ -f "$config_file" ] || echo ' (missing, using the defaults)')"
+    echo "hosts:    $hosts_file$([ -f "$hosts_file" ] || echo ' (missing, no tokens)')"
+    echo "log:      $log_file"
+    [ -n "$proxy" ] && echo "upstream: $proxy"
+    exit 0
+    ;;
+
+  logs)
+    [ -f "$log_file" ] || die "no log yet at $log_file"
+    echo "ssbx: $log_file" >&2
+    if command -v python3 >/dev/null 2>&1; then
+      exec tail -n 100 -F "$log_file" | python3 "$script_dir/lib/logs" "${2:-all}"
+    fi
+    exec tail -n 100 -F "$log_file"
+    ;;
+
+  reload)
+    if [ "$(vm_state)" = Running ]; then
+      docker rm --force --volumes ssbx-proxy >/dev/null 2>&1 || true
+    fi
+    echo "ssbx: the proxy starts again with the current settings on your next ssbx"
+    exit 0
+    ;;
+
+  rebuild)
+    command=rebuild
+    ;;
+
+  --)
+    shift
+    ;;
+esac
+
+
+# ------------------------------------------------------------- the project
+#
+# The sandbox gets the project you are in: the git repository if there is one,
+# otherwise the current directory. It has to be inside one of the mounts (see
+# config). It cannot be your home directory itself, nor anything under a
+# dot-folder of it: those hold your keys, your Claude login and ssbx itself.
+
+current_dir="$(pwd -P)"
+home_dir="$(cd "$HOME" && pwd -P)"
+project_dir="$current_dir"
+git_dir=""
+if command -v git >/dev/null 2>&1 && git -C "$current_dir" rev-parse --show-toplevel >/dev/null 2>&1; then
+  project_dir="$(git -C "$current_dir" rev-parse --show-toplevel)"
+  # A worktree or a submodule keeps its repository elsewhere; git needs it too.
+  git_dir="$(cd "$(git -C "$current_dir" rev-parse --git-common-dir)" && pwd -P)"
+  if [ "$project_dir" = "$home_dir" ]; then
+    project_dir="$current_dir"  # a repository in $HOME itself does not make every folder one project
+    git_dir=""
+  fi
+fi
+
+if [ "$command" != rebuild ]; then
+  case "$project_dir" in
+    "$home_dir" | / | "$home_dir"/.*)
+      die "run this inside a project, not in $project_dir"
+      ;;
+  esac
+  for private in "$config_dir" "$state_dir"; do
+    private="$(cd "$private" 2>/dev/null && pwd -P || echo "$private")"
+    case "$project_dir" in
+      "$private" | "$private"/*) die "run this inside a project, not in $project_dir" ;;
+    esac
+    case "$private" in
+      "$project_dir"/*) die "$private is inside the project; the sandbox must not see it" ;;
+    esac
+  done
+fi
+
+mount_options=()
+project_mounted=false
+state_mounted=false
+for dir in ${mounts[@]+"${mounts[@]}"}; do
+  [ -d "$dir" ] || die "mount $dir from the config does not exist"
+  dir="$(cd "$dir" && pwd -P)"
+  mount_options+=(--mount "$dir:w")
+  case "$project_dir" in "$dir" | "$dir"/*) project_mounted=true ;; esac
+  case "$state_dir" in "$dir" | "$dir"/*) state_mounted=true ;; esac
+done
+if [ "$command" != rebuild ] && [ "$project_mounted" = false ]; then
+  die "$project_dir is outside the folders the sandbox can see (mounts in $config_file: ${mounts[*]+${mounts[*]}})"
+fi
+
+mkdir -p "$state_dir"
+chmod 700 "$state_dir"
+if [ "$state_mounted" = false ]; then
+  mount_options+=(--mount "$state_dir:w")
+fi
+
+
+# ------------------------------------------------------------- the hosts file
+#
+# Checked here, so that a typo is reported with its line and not as a proxy
+# that will not start. The file holds tokens: it is made private if it is not.
+
+hosts=""
+if [ -f "$hosts_file" ]; then
+  chmod 600 "$hosts_file"
+  hosts="$(cat "$hosts_file")"
+  line_number=0
+  while read -r host kind token || [ -n "$host" ]; do
+    line_number=$((line_number + 1))
+    case "$host" in
+      "" | "#"*) continue ;;
+    esac
+    [ -n "$token" ] || die "$hosts_file line $line_number: expected 'host kind token'"
+    case "$kind" in
+      gitlab | github | atlassian | bearer) ;;
+      *) die "$hosts_file line $line_number: unknown kind '$kind' (gitlab, github, atlassian or bearer)" ;;
+    esac
+  done < "$hosts_file"
+else
+  echo "ssbx: no $hosts_file yet, so the sandbox has no tokens (see hosts.example)" >&2
+fi
+
+
+# ------------------------------------------------------------- the VM
+#
+# Start it if it is not running yet. --activate=false leaves your normal
+# Docker context as it is. The proxy from the config reaches the VM too, so
+# that image downloads work behind it. What the VM was started with is noted,
+# because Colima applies changes only at the next start.
+
+vm_config="cpus=$cpus memory=$memory disk=$disk mounts=${mount_options[*]}"
+
+state="$(vm_state)"
+if [ "$state" = Broken ]; then
+  echo "ssbx: the VM did not shut down cleanly last time, cleaning up" >&2
+  colima stop --force --profile "$profile" >/dev/null 2>&1 || true
+  state=Stopped
+fi
+
+if [ "$state" = Running ]; then
+  if [ "$(cat "$state_dir/vm" 2>/dev/null)" != "$vm_config" ]; then
+    die "the VM is running with older settings (mounts, cpus, memory or disk changed). Run: ssbx stop"
+  fi
+else
+  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u NO_PROXY -u no_proxy \
+    ${proxy_on_host:+HTTP_PROXY="$proxy_on_host" HTTPS_PROXY="$proxy_on_host"} \
+    colima start --profile "$profile" \
+      --runtime docker --kubernetes=false \
+      --cpus "$cpus" --memory "$memory" --disk "$disk" \
+      "${mount_options[@]}" \
+      --env "HTTP_PROXY=$proxy,HTTPS_PROXY=$proxy,http_proxy=$proxy,https_proxy=$proxy" \
+      --activate=false --ssh-config=false
+  printf '%s' "$vm_config" > "$state_dir/vm"
+fi
+
+
+# ------------------------------------------------------------- the images
+#
+# Built on the first run, again when their sources change (after a git pull,
+# say), from scratch with `ssbx rebuild`. The proxy image is built first: it
+# creates the certificate that the agent image then copies from it. The
+# sandbox user is you: same uid and home path, so files it creates in the
+# project are yours and paths in your Claude settings keep working.
+
+uid="$(id -u)"
+gid="$(id -g)"
+user_name="$(id -un)"
+case "$user_name" in
+  [a-z_]*) ;;
+  *) user_name=agent ;;
+esac
+case "$user_name" in
+  *[!a-z0-9_-]*) user_name=agent ;;
+esac
+[ "$uid" != 0 ] || die "do not run this as root"
+
+build_inputs="$(for f in "$script_dir/Dockerfile" "$script_dir"/proxy/* "$script_dir"/sandbox/*; do
+  [ -f "$f" ] && cat "$f"
+done | cksum | cut -d ' ' -f 1)"
+build_id="$build_inputs-$uid-$gid-$user_name-$HOME-${packages[*]+${packages[*]}}"
+
+build_args=(--build-arg "UID=$uid" --build-arg "GID=$gid" --label "ssbx.build=$build_id"
+            --add-host host.docker.internal:host-gateway)
+if [ -n "$proxy" ]; then
+  build_args+=(--build-arg "HTTP_PROXY=$proxy" --build-arg "HTTPS_PROXY=$proxy"
+               --build-arg "http_proxy=$proxy" --build-arg "https_proxy=$proxy")
+fi
+
+build() {
+  # If the agent image fails to build, the proxy image goes back to the one
+  # whose certificate the old agent image trusts.
+  docker tag ssbx-proxy ssbx-proxy:previous >/dev/null 2>&1 || true
+  docker build "$@" "${build_args[@]}" --target proxy --tag ssbx-proxy "$script_dir"
+  if ! docker build "$@" "${build_args[@]}" --target agent --tag ssbx \
+      --build-arg "USER_NAME=$user_name" --build-arg "HOME_DIR=$HOME" \
+      --build-arg "PACKAGES=${packages[*]+${packages[*]}}" "$script_dir"; then
+    docker tag ssbx-proxy:previous ssbx-proxy >/dev/null 2>&1 || true
+    die "the sandbox image did not build"
+  fi
+  docker rmi ssbx-proxy:previous >/dev/null 2>&1 || true
+  # The running proxy still has the old certificate. It starts again below.
+  docker rm --force --volumes ssbx-proxy >/dev/null 2>&1 || true
+}
+
+image_build() {
+  docker image inspect --format '{{ index .Config.Labels "ssbx.build" }}' "$1" 2>/dev/null || true
+}
+
+if [ "$command" = rebuild ]; then
+  build --no-cache
+  exit 0
+fi
+
+if [ "$(image_build ssbx)" != "$build_id" ] || [ "$(image_build ssbx-proxy)" != "$build_id" ]; then
+  echo "ssbx: building the images, this takes a few minutes the first time" >&2
+  build
+fi
+
+
+# ------------------------------------------------------------- the proxy
+#
+# The sandbox sits on an internal network with no way out, not even to the VM
+# (isolated mode). The proxy is on the normal network too, so it is the only
+# thing that can reach the internet. It is started again when the hosts file
+# or the settings it uses change (a checksum of them is kept as a label on the
+# container), or when it is not running for whatever reason.
+
+proxy_config="$(printf '%s\n%s\n%s\n%s\n%s' "$hosts" "$proxy" "$state_dir" "$log_name" "$build_id" | cksum | cut -d ' ' -f 1)"
+if docker container inspect ssbx-proxy >/dev/null 2>&1; then
+  running_config="$(docker container inspect --format '{{ index .Config.Labels "ssbx.config" }}' ssbx-proxy)"
+  running_state="$(docker container inspect --format '{{ .State.Status }}' ssbx-proxy)"
+  on_network="$(docker container inspect --format '{{ if index .NetworkSettings.Networks "ssbx" }}yes{{ end }}' ssbx-proxy)"
+  if [ "$running_config" != "$proxy_config" ] || [ "$running_state" != running ] || [ "$on_network" != yes ]; then
+    docker rm --force --volumes ssbx-proxy >/dev/null 2>&1 || true
+  fi
+fi
+
+if docker network inspect ssbx >/dev/null 2>&1 \
+   && [ "$(docker network inspect --format '{{ index .Options "com.docker.network.bridge.gateway_mode_ipv4" }}' ssbx)" != isolated ]; then
+  docker rm --force --volumes ssbx-proxy >/dev/null 2>&1 || true
+  docker network rm ssbx >/dev/null
+fi
+if ! docker network inspect ssbx >/dev/null 2>&1; then
+  docker network create --internal --opt com.docker.network.bridge.gateway_mode_ipv4=isolated ssbx >/dev/null
+fi
+
+if ! docker container inspect ssbx-proxy >/dev/null 2>&1; then
+  docker create \
+    --name ssbx-proxy \
+    --restart unless-stopped \
+    --label "ssbx.config=$proxy_config" \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
+    --add-host host.docker.internal:host-gateway \
+    --env SSBX_HOSTS="$hosts" \
+    --env SSBX_UPSTREAM="$proxy" \
+    --env SSBX_LOG_FILE="/ssbx/state/$log_name" \
+    --volume "$state_dir:/ssbx/state" \
+    ssbx-proxy >/dev/null
+  docker network connect --alias proxy ssbx ssbx-proxy
+  docker start ssbx-proxy >/dev/null
+
+  # Wait until it listens. If it does not, say why instead of starting a
+  # sandbox that cannot reach anything.
+  tries=0
+  until docker exec ssbx-proxy python3 -c 'import socket; socket.create_connection(("127.0.0.1", 8080), 1)' >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 20 ] || [ "$(docker container inspect --format '{{ .State.Status }}' ssbx-proxy)" != running ]; then
+      docker logs --tail 20 ssbx-proxy >&2 || true
+      docker rm --force --volumes ssbx-proxy >/dev/null 2>&1 || true
+      die "the proxy did not start; check the hosts file and the proxy setting in $config_file"
+    fi
+    sleep 0.5
+  done
+fi
+
+
+# ------------------------------------------------------------- your settings
+#
+# Your Claude Code settings go into the sandbox before every session: the items
+# from `sync`, your MCP servers and the settings of this project. A throwaway
+# container with the sandbox's home directory receives them as a tar stream
+# and installs them (see sandbox/sync). The login is only copied if you ask.
+
+sync_items=()
+for item in ${sync[@]+"${sync[@]}"}; do
+  [ -e "$HOME/.claude/$item" ] && sync_items+=(".claude/$item")
+done
+if [ "$sync_login" = true ] && [ -f "$HOME/.claude/.credentials.json" ]; then
+  sync_items+=(.claude/.credentials.json)
+fi
+[ -f "$HOME/.claude.json" ] && sync_items+=(.claude.json)
+
+{ if [ "${#sync_items[@]}" -gt 0 ]; then tar -c -h -C "$HOME" -f - "${sync_items[@]}" 2>/dev/null || true; fi; } \
+  | docker run --rm --interactive --network none \
+      --volume "ssbx-home:$HOME" \
+      --env "HOME=$HOME" \
+      --env "SSBX_PROJECT=$project_dir" \
+      --env "SSBX_SYNC=${sync[*]+${sync[*]}}" \
+      --env "SSBX_SYNC_MCP=$sync_mcp" \
+      ssbx /usr/bin/python3 -I /opt/ssbx/sync
+
+# The permission mode from the config, as a managed setting no settings file
+# inside can override, and what the audit hook should report. Mounted
+# read-only into the sandbox.
+{
+  printf '{ "env": { "SSBX_LOG": "%s" }' "$log"
+  if [ -n "$permission_mode" ]; then
+    printf ', "permissions": { "defaultMode": "%s" }' "$permission_mode"
+  fi
+  printf ' }\n'
+} > "$state_dir/managed.json"
+
+
+# ------------------------------------------------------------- git
+#
+# Remotes like git@gitlab.com:group/repo.git would try SSH, which has no way
+# out of the sandbox. For every host in the hosts file, git inside the
+# sandbox rewrites them to https://gitlab.com/group/repo.git. Commits inside
+# are signed with your name and email, if git on your machine knows them.
+
+git_settings=()
+count=0
+
+if [ -f "$hosts_file" ]; then
+  while read -r host _ || [ -n "$host" ]; do
+    case "$host" in
+      "" | "#"*) continue ;;
+    esac
+    git_settings+=(--env "GIT_CONFIG_KEY_$count=url.https://$host/.insteadOf")
+    git_settings+=(--env "GIT_CONFIG_VALUE_$count=git@$host:")
+    count=$((count + 1))
+    git_settings+=(--env "GIT_CONFIG_KEY_$count=url.https://$host/.insteadOf")
+    git_settings+=(--env "GIT_CONFIG_VALUE_$count=ssh://git@$host/")
+    count=$((count + 1))
+  done < "$hosts_file"
+fi
+
+git_settings+=(--env "GIT_CONFIG_COUNT=$count")
+
+if command -v git >/dev/null 2>&1; then
+  git_name="$(git config --get user.name 2>/dev/null || true)"
+  git_email="$(git config --get user.email 2>/dev/null || true)"
+  [ -n "$git_name" ] && git_settings+=(--env "GIT_AUTHOR_NAME=$git_name" --env "GIT_COMMITTER_NAME=$git_name")
+  [ -n "$git_email" ] && git_settings+=(--env "GIT_AUTHOR_EMAIL=$git_email" --env "GIT_COMMITTER_EMAIL=$git_email")
+fi
+
+
+# ------------------------------------------------------------- the sandbox
+#
+# --cap-drop ALL and no-new-privileges: nobody inside can become root.
+# The ssbx-home volume is the home directory inside, at the same path as on
+# your machine. The project is mounted at the same path it has on your
+# machine, too. The proxy variables are given again here: a proxies section
+# in ~/.docker/config.json would otherwise replace the ones from the image.
+
+run_options=(
+  --rm --interactive --init
+  --hostname ssbx
+  --network ssbx
+  --cap-drop ALL
+  --security-opt no-new-privileges
+  --volume "ssbx-home:$HOME"
+  --volume "$project_dir:$project_dir"
+  --volume "$state_dir/managed.json:/etc/claude-code/managed-settings.d/50-ssbx.json:ro"
+  --workdir "$current_dir"
+  --env HTTP_PROXY=http://proxy:8080 --env HTTPS_PROXY=http://proxy:8080
+  --env http_proxy=http://proxy:8080 --env https_proxy=http://proxy:8080
+  --env NO_PROXY=localhost,127.0.0.1 --env no_proxy=localhost,127.0.0.1
+  "${git_settings[@]}"
+)
+
+case "$git_dir" in
+  "$project_dir" | "$project_dir"/*) ;;
+  "") ;;
+  *) run_options+=(--volume "$git_dir:$git_dir") ;;
+esac
+
+for variable in ${env[@]+"${env[@]}"}; do
+  run_options+=(--env "$variable")
+done
+run_options+=(${docker_options[@]+"${docker_options[@]}"})
+
+# A terminal only when ssbx itself runs in one, so `ssbx some-command` also
+# works from scripts.
+if [ -t 0 ] && [ -t 1 ]; then
+  run_options+=(--tty)
+fi
+
+unset -f docker
+if [ "$#" -eq 0 ]; then
+  exec docker --context "$context" run "${run_options[@]}" ssbx bash
+else
+  exec docker --context "$context" run "${run_options[@]}" ssbx "$@"
+fi

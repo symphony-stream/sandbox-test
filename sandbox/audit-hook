@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""
+Claude Code hook inside the sandbox. Reports what the agent does to the
+ssbx audit log.
+
+Claude Code runs this for the events wired up in managed-settings.json and
+gives it the event as JSON on stdin. We turn it into one small audit event and
+post it to http://ssbx.audit/ through the proxy, which appends it to the log
+on your machine. Nothing here can change what Claude does: we never answer,
+and we exit 0 whatever happens, so a broken log never blocks the agent.
+
+Events:
+  session_start, session_end, prompt, tool, asked, denied, tool_failed
+With SSBX_LOG=blocked, only refusals and failures are reported (no prompt
+and no tool events).
+"""
+
+import http.client
+import json
+import os
+import re
+import sys
+
+PROXY_HOST, PROXY_PORT = "proxy", 8080
+EVERYTHING = os.environ.get("SSBX_LOG", "all") != "blocked"
+MAX_TEXT = 500
+
+# Tokens that may show up in commands or prompts are not worth logging.
+SECRET = re.compile(r"(glpat-|ghp_|gho_|github_pat_|sk-ant-|xox[abp]-|ATATT|AKIA)[A-Za-z0-9_\-]{8,}"
+                    r"|(bearer\s+|token[=:]\s*|password[=:]\s*)[^\s'\"]+", re.IGNORECASE)
+
+
+def short(value, limit=MAX_TEXT):
+    """A copy of a hook value with long strings cut and secrets hidden."""
+    if isinstance(value, str):
+        value = SECRET.sub(lambda m: m.group(2) + "***" if m.group(2) else "***", value)
+        return value if len(value) <= limit else value[:limit] + "…"
+    if isinstance(value, dict):
+        return {k: short(v) for k, v in list(value.items())[:40]}
+    if isinstance(value, list):
+        return [short(v) for v in value[:20]]
+    return value
+
+
+def main():
+    data = json.load(sys.stdin)
+    kind = data.get("hook_event_name")
+
+    event = {"source": "sandbox", "session": data.get("session_id"), "cwd": data.get("cwd")}
+    if data.get("agent_id"):
+        event["agent"] = data.get("agent_type") or data.get("agent_id")
+
+    if kind == "PreToolUse":
+        if not EVERYTHING:
+            return
+        event.update(event="tool", tool=data.get("tool_name"), input=short(data.get("tool_input")),
+                     id=data.get("tool_use_id"))
+    elif kind == "PermissionDenied":
+        event.update(event="denied", tool=data.get("tool_name"), input=short(data.get("tool_input")),
+                     id=data.get("tool_use_id"), reason=short(data.get("reason")))
+    elif kind == "PermissionRequest":
+        event.update(event="asked", tool=data.get("tool_name"), input=short(data.get("tool_input")))
+    elif kind == "PostToolUseFailure":
+        event.update(event="tool_failed", tool=data.get("tool_name"), input=short(data.get("tool_input")),
+                     id=data.get("tool_use_id"), error=short(data.get("error")))
+    elif kind == "UserPromptSubmit":
+        if not EVERYTHING:
+            return
+        event.update(event="prompt", text=short(data.get("prompt"), 300), mode=data.get("permission_mode"))
+    elif kind == "SessionStart":
+        event.update(event="session_start", how=data.get("source"), mode=data.get("permission_mode"),
+                     model=data.get("model"))
+    elif kind == "SessionEnd":
+        event.update(event="session_end", reason=data.get("reason"))
+    else:
+        return
+
+    event = {k: v for k, v in event.items() if v is not None}
+    body = json.dumps(event, ensure_ascii=False).encode()
+    if len(body) > 15000 and "input" in event:  # the proxy takes 16 KiB at most
+        event["input"] = {"truncated": True, "keys": sorted(event["input"])} if isinstance(event["input"], dict) else "…"
+        body = json.dumps(event, ensure_ascii=False).encode()
+    # Straight to the proxy, as a proxy request for a name that only it knows.
+    connection = http.client.HTTPConnection(PROXY_HOST, PROXY_PORT, timeout=3)
+    connection.request("POST", "http://ssbx.audit/", body=body, headers={"Content-Type": "application/json"})
+    connection.getresponse().read()
+    connection.close()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass  # the log is best effort; never get in the agent's way
+    sys.exit(0)

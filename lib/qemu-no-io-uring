@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""
+Run QEMU without io_uring. Used by ssbx on Linux only.
+
+QEMU 10.2 and later drive their main loop with io_uring. Together with the
+socket network device that Lima gives the VM, that hits a bug in QEMU: under
+network load the VM dies with
+
+    net_fill_rstate: Assertion `size == 0' failed
+
+(https://gitlab.com/qemu-project/qemu/-/issues/3285). When io_uring is not
+available QEMU quietly falls back to epoll, and the bug never triggers.
+
+This wrapper installs a seccomp filter that makes the io_uring_setup system
+call fail with EPERM, then runs the real QEMU with the same arguments. The
+ssbx script points Lima at it through QEMU_SYSTEM_X86_64 / QEMU_SYSTEM_AARCH64.
+On a QEMU without the bug it changes nothing but the event loop.
+"""
+
+import ctypes
+import os
+import struct
+import sys
+
+PR_SET_NO_NEW_PRIVS = 38
+PR_SET_SECCOMP = 22
+SECCOMP_MODE_FILTER = 2
+SECCOMP_RET_ALLOW = 0x7FFF0000
+SECCOMP_RET_ERRNO = 0x00050000
+EPERM = 1
+NR_IO_URING_SETUP = 425  # the same number on every architecture
+AUDIT_ARCH = {"x86_64": 0xC000003E, "aarch64": 0xC00000B7}
+
+machine = os.uname().machine
+name = f"qemu-system-{machine}"
+
+
+def real_qemu():
+    """The first qemu-system binary on PATH that is not this wrapper."""
+    me = os.path.realpath(sys.argv[0])
+    for directory in os.environ.get("PATH", "/usr/bin:/bin").split(os.pathsep):
+        path = os.path.join(directory, name)
+        if os.access(path, os.X_OK) and os.path.realpath(path) != me:
+            return path
+    return f"/usr/bin/{name}"
+
+
+def deny_io_uring(arch):
+    def ins(code, jt, jf, k):
+        return struct.pack("HBBI", code, jt, jf, k)
+
+    LD_W_ABS, JEQ_K, RET_K = 0x20, 0x15, 0x06
+    prog = b"".join([
+        ins(LD_W_ABS, 0, 0, 4),                    # load seccomp_data.arch
+        ins(JEQ_K, 1, 0, arch),                    # our architecture?
+        ins(RET_K, 0, 0, SECCOMP_RET_ALLOW),       # no: leave it alone
+        ins(LD_W_ABS, 0, 0, 0),                    # load seccomp_data.nr
+        ins(JEQ_K, 0, 1, NR_IO_URING_SETUP),       # io_uring_setup?
+        ins(RET_K, 0, 0, SECCOMP_RET_ERRNO | EPERM),  # yes: fail with EPERM
+        ins(RET_K, 0, 0, SECCOMP_RET_ALLOW),       # everything else: allow
+    ])
+    buf = ctypes.create_string_buffer(prog)
+
+    class SockFprog(ctypes.Structure):
+        _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.c_void_p)]
+
+    fprog = SockFprog(len(prog) // 8, ctypes.addressof(buf))
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+        return False
+    if libc.prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ctypes.byref(fprog), 0, 0) != 0:
+        return False
+    return True
+
+
+arch = AUDIT_ARCH.get(machine)
+if arch is None or not deny_io_uring(arch):
+    sys.stderr.write(f"ssbx: could not turn off io_uring for {name}, running it as is\n")
+
+qemu = real_qemu()
+os.execv(qemu, [qemu] + sys.argv[1:])

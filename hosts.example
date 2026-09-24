@@ -1,0 +1,26 @@
+# Copy this file to ~/.config/ssbx/hosts and fill in your tokens.
+# After editing it, run `ssbx reload`.
+#
+# Each line is:   host   kind   token
+#
+# The sandbox may only read from these hosts: git clone, git fetch, GET
+# requests and Jira searches. It cannot push, open merge requests, comment,
+# run pipelines or change anything else. The proxy adds the token to the
+# requests it lets through; the sandbox never sees the token.
+#
+# Still give it read-only tokens. Then even a mistake in the proxy cannot
+# turn into a write.
+#
+# kind is one of:
+#   gitlab      GitLab token (read_api, read_repository)
+#   github      GitHub fine-grained token (Contents: read, Metadata: read)
+#   atlassian   Jira or Confluence Cloud: your-email:api-token
+#   bearer      anything that takes "Authorization: Bearer <token>",
+#               for example Jira or Confluence Data Center
+
+# gitlab.com               gitlab      glpat-xxxxxxxxxxxxxxxxxxxx
+# gitlab.example.com       gitlab      glpat-xxxxxxxxxxxxxxxxxxxx
+# github.com               github      github_pat_xxxxxxxxxxxxxxxx
+# api.github.com           github      github_pat_xxxxxxxxxxxxxxxx
+# example.atlassian.net    atlassian   you@example.com:ATATT3xxxxxxxxxxxx
+# jira.example.com         bearer      xxxxxxxxxxxxxxxxxxxxxxxx
