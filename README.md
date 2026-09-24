@@ -1,47 +1,61 @@
 # ssbx
 
-A bare Debian VM that can reach only the hosts you allow, running the
-allowlist proxy itself (plain [mitmproxy](https://mitmproxy.org/), no
-custom code) as a systemd service; no agent of its own, install yours
-inside it, through the proxy.
+A sandbox for coding agents: a Colima VM with an Incus container inside.
+The container has no network device at all; its only way out is an
+allowlist proxy (plain [mitmproxy](https://mitmproxy.org/), no custom
+code) running in the VM. Your `~/sandbox` and `~/.claude` are mounted
+into the container at the same paths, so the agent inside works on your
+projects with your Claude Code login, settings and skills.
 
 ## Install
-Lima: macOS `brew install lima`; Linux: lima, qemu, `virtiofsd` from your
-distribution, or [Lima's releases](https://github.com/lima-vm/lima/releases).
+macOS: `brew install colima incus`. Linux: colima and the incus client
+from your package manager.
 
 ```sh
-git clone https://github.com/symphony-stream/sandbox-test ~/Work/ssbx && ~/Work/ssbx/install.sh
-limactl start template:ssbx
-cd ~/Work/project && limactl shell ssbx
-# then install your agent inside, e.g.:
-sudo apt install -y nodejs npm && sudo npm i -g @anthropic-ai/claude-code
+git clone https://github.com/symphony-stream/sandbox-test ~/ssbx
+mkdir -p ~/sandbox ~/.config/ssbx ~/.colima/ssbx
+cp ~/ssbx/config.yaml ~/.config/ssbx/ && cp ~/ssbx/colima.yaml ~/.colima/ssbx/
+colima start ssbx            # Linux: add --vm-type qemu --mount-type 9p
+incus list                   # wait until ssbx is RUNNING (first start downloads the image)
 ```
 
-Add the agent's config folder to `mounts` in `ssbx.yaml` (see the commented
-examples) so its login/settings are shared, then `limactl stop ssbx &&
-limactl start ssbx`. Later starts: `limactl start ssbx`. Stop: `limactl
-stop ssbx`. Rebuild: `limactl delete ssbx`.
+To work inside as yourself, put this in your shell rc:
+
+```sh
+ssbx() { incus exec ssbx --user "$(id -u)" --group "$(id -g)" --cwd "$PWD" --env HOME="$HOME" -- bash -l; }
+```
+
+Then `cd ~/sandbox/project && ssbx`, and install your agent inside, e.g.
+`sudo apt install -y nodejs npm && sudo npm i -g @anthropic-ai/claude-code`.
+On macOS Claude Code keeps its login in the Keychain, so run `claude`
+once inside and log in; the credentials land in the mounted `~/.claude`
+and survive rebuilds. `incus shell ssbx` gives a root shell.
+
+Stop and start: `colima stop ssbx`, `colima start ssbx`. Rebuild the
+container: `incus delete -f ssbx && colima restart ssbx`. Remove
+everything: `colima delete ssbx`.
 
 ## The allowlist
-Edit `~/.config/ssbx/config.yaml` (mitmproxy's own config; comments at the
-top explain the syntax). It holds one `block_list` rule: everything not
-matching it gets refused. For example, to allow reads on a host:
+Edit `~/.config/ssbx/config.yaml` (mitmproxy's own config; the comments
+at the top explain the syntax). It holds one `block_list` rule:
+everything not matching it gets a 403. To allow reads on a host, add an
+arm to the list:
 
 ```yaml
 | ~d "^example\.com$" & ~m "^(GET|HEAD)$"
 ```
 
-Tokens go in via `modify_headers`, which injects a header into matching
-requests - no code needed (see the commented examples). `tail -f
-~/.config/ssbx/proxy.log` shows every request; a blocked one ends `<< 403
-Forbidden`. Add the host as above and the proxy restarts within seconds.
+Tokens go in via `modify_headers` (see the commented examples).
+`tail -f ~/.config/ssbx/proxy.log` shows every request; a blocked one
+ends `<< 403 Forbidden`. Add the host and the proxy restarts within
+seconds.
 
 ## What it protects
-The VM sees only the folders you mount in `ssbx.yaml` - your projects and
-whichever agent's config folder you add, login included. The proxy inside
-can only reach the hosts you list, never your own machine: an unlisted
-host gets a 403 without any connection ever opening. Tokens in
-`config.yaml` are visible inside the VM, so prefer narrow ones. `sudo`
-inside is normal; the firewall only keeps ordinary tools on the proxy.
+The container sees only the mounted folders. It has no network device;
+port 8080 inside is the proxy in the VM, which reaches only the hosts
+you list and never your machine (an unlisted host gets a 403 without any
+connection opening). Root inside the container cannot change that: the
+proxy and the VM are outside it. `config.yaml` with its tokens is
+mounted into the VM only, not into the container.
 
 ## License: MIT, see LICENSE.

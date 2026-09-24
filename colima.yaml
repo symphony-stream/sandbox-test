@@ -1,0 +1,167 @@
+# ssbx: a Colima VM with an Incus container inside, whose only way out is an
+# allowlist proxy (plain mitmproxy, configured by ~/.config/ssbx/config.yaml).
+#
+#   mkdir -p ~/sandbox ~/.config/ssbx ~/.colima/ssbx
+#   cp config.yaml ~/.config/ssbx/ && cp colima.yaml ~/.colima/ssbx/
+#   colima start ssbx
+#
+# Edit the numbers and the mounts below to taste. Linux: start with
+# `colima start ssbx --vm-type qemu --mount-type 9p` (virtiofs is macOS only).
+
+runtime: incus
+cpu: 4
+memory: 3        # GiB for the VM; the container lives inside it
+disk: 60
+vmType: vz
+mountType: virtiofs
+
+# Folders the container sees, at the same paths as on your machine.
+# ~/sandbox: your projects. ~/.claude: Claude Code login, settings, skills.
+# ~/.config/ssbx: proxy config and log; stays in the VM, not in the container.
+mounts:
+  - location: ~/sandbox
+    writable: true
+  - location: ~/.claude
+    writable: true
+  - location: ~/.config/ssbx
+    writable: true
+# - location: ~/Work
+#   writable: true
+# - location: ~/.codex
+#   writable: true
+
+provision:
+  # Runs as root on every start: the proxy service in the VM, and the uid
+  # mapping Incus needs to run the container as you.
+  - mode: system
+    script: |
+      set -eu
+      USER_NAME=$(basename "$(ls -d /home/*.linux | head -1)" .linux)
+      USER_UID=$(id -u "$USER_NAME")
+      CFG=$(findmnt -rn -o TARGET | grep '/\.config/ssbx$' | head -1)
+      [ -n "$CFG" ] || { echo "ssbx: ~/.config/ssbx is not mounted" >&2; exit 1; }
+
+      if [ ! -x /opt/mitm/bin/mitmdump ]; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -q && apt-get install -yq python3-venv
+        python3 -m venv /opt/mitm && /opt/mitm/bin/pip install -q mitmproxy
+      fi
+      mkdir -p /var/lib/ssbx
+      ln -sfn "$CFG/config.yaml" /var/lib/ssbx/config.yaml
+      touch "$CFG/proxy.log"; chown "$USER_UID" "$CFG/proxy.log" || true
+      # mitmdump does not reload its config, so the unit restarts it when the
+      # file changes (stat -L follows the symlink; %% escapes systemd's %).
+      cat > /etc/systemd/system/ssbx-proxy.service <<UNIT
+      [Unit]
+      Description=ssbx allowlist proxy
+      After=network.target
+      [Service]
+      ExecStart=/bin/sh -c '/opt/mitm/bin/mitmdump --set confdir=/var/lib/ssbx & p=\$!; m0=\$(stat -Lc %%Y /var/lib/ssbx/config.yaml 2>/dev/null||echo 0); while kill -0 \$p 2>/dev/null; do sleep 3; m1=\$(stat -Lc %%Y /var/lib/ssbx/config.yaml 2>/dev/null||echo 0); [ "\$m1" != "\$m0" ] && kill \$p; done; wait \$p'
+      Restart=always
+      RestartSec=3
+      StartLimitIntervalSec=0
+      StandardOutput=append:$CFG/proxy.log
+      StandardError=append:$CFG/proxy.log
+      [Install]
+      WantedBy=multi-user.target
+      UNIT
+      systemctl daemon-reload
+      systemctl enable -q ssbx-proxy.service
+      systemctl restart ssbx-proxy.service
+
+      changed=0
+      for f in /etc/subuid /etc/subgid; do
+        grep -q "^root:$USER_UID:1$" "$f" || { echo "root:$USER_UID:1" >> "$f"; changed=1; }
+      done
+      [ "$changed" = 0 ] || systemctl try-restart incus.service || true
+
+  # Runs once Incus is up: the container profile, then the container itself.
+  - mode: ready
+    script: |
+      set -eu
+      USER_NAME=$(basename "$(ls -d /home/*.linux | head -1)" .linux)
+      USER_UID=$(id -u "$USER_NAME")
+      CFG=$(findmnt -rn -o TARGET | grep '/\.config/ssbx$' | head -1)
+      HOME_DIR=${CFG%/.config/ssbx}
+      P=http://127.0.0.1:8080
+      for i in $(seq 60); do sudo -n incus info >/dev/null 2>&1 && break; sleep 2; done
+      POOL=$(sudo -n incus storage list -f csv | head -1 | cut -d, -f1)
+
+      PROFILE=$(cat <<EOF
+      description: ssbx sandbox
+      config:
+        boot.autostart: "true"
+        limits.memory: 2GiB
+        raw.idmap: "both $USER_UID $USER_UID"
+        cloud-init.network-config: "network: {config: disabled}"
+        cloud-init.user-data: |
+          #cloud-config
+          users:
+            - name: $USER_NAME
+              uid: $USER_UID
+              homedir: $HOME_DIR
+              shell: /bin/bash
+              groups: sudo
+              sudo: ALL=(ALL) NOPASSWD:ALL
+              lock_passwd: true
+          bootcmd:
+            - [systemctl, mask, --now, systemd-networkd-wait-online.service]
+          write_files:
+            - path: /etc/environment
+              content: |
+                PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+                HTTP_PROXY=$P
+                HTTPS_PROXY=$P
+                http_proxy=$P
+                https_proxy=$P
+                NO_PROXY=
+                no_proxy=
+            - path: /etc/profile.d/ssbx.sh
+              content: |
+                export HTTP_PROXY=$P HTTPS_PROXY=$P http_proxy=$P https_proxy=$P NO_PROXY= no_proxy=
+            - path: /etc/apt/apt.conf.d/90ssbx
+              content: |
+                Acquire::http::Proxy "$P";
+                Acquire::https::Proxy "$P";
+            - path: /etc/sudoers.d/ssbx
+              content: |
+                Defaults env_keep += "HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy"
+          runcmd:
+            - chown $USER_UID:$USER_UID $HOME_DIR
+            - until curl -sf -x $P http://mitm.it/cert/pem -o /usr/local/share/ca-certificates/ssbx.crt; do sleep 2; done
+            - update-ca-certificates
+            - apt-get update -q
+            - apt-get install -yq git ca-certificates
+      devices:
+        root:
+          type: disk
+          path: /
+          pool: $POOL
+        # No network device at all: this proxy device is the only way out.
+        proxy:
+          type: proxy
+          listen: tcp:127.0.0.1:8080
+          connect: tcp:127.0.0.1:8080
+          bind: instance
+        sandbox:
+          type: disk
+          source: $HOME_DIR/sandbox
+          path: $HOME_DIR/sandbox
+          shift: "true"
+        claude:
+          type: disk
+          source: $HOME_DIR/.claude
+          path: $HOME_DIR/.claude
+          shift: "true"
+      EOF
+      )
+      if sudo -n incus profile show ssbx >/dev/null 2>&1; then
+        printf '%s\n' "$PROFILE" | sudo -n incus profile edit ssbx
+      else
+        printf '%s\n' "$PROFILE" | sudo -n incus profile create ssbx
+      fi
+      if ! sudo -n incus info ssbx >/dev/null 2>&1; then
+        sudo -n incus launch images:debian/13/cloud ssbx -p ssbx
+      else
+        sudo -n incus start ssbx 2>/dev/null || true
+      fi
