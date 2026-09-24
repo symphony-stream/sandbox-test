@@ -11,11 +11,10 @@
 # Whitespace/newlines inside the filter are ignored.
 #
 # Tokens: modify_headers injects a header into matching requests, no code
-# needed (examples below). Edit this file on the host; mitmdump notices
-# and restarts within a few seconds. A blocked request gets a plain 403
-# and a line in ~/.config/ssbx/proxy.log ("<< HTTP/1.1 403 Forbidden").
+# needed (examples below). Restart mitmproxy after editing. A blocked
+# request gets a plain 403 and shows up red in mitmproxy's list.
 
-listen_host: 0.0.0.0     # the container reaches the proxy over the Incus network
+listen_host: 127.0.0.1   # the VM reaches it through Colima's gateway (192.168.5.2)
 listen_port: 8080
 connection_strategy: lazy
 upstream_cert: false
@@ -25,8 +24,10 @@ termlog_verbosity: warn
 # A corporate upstream proxy for all of ssbx's own traffic:
 #mode: upstream:http://proxy:3128
 
-# The allowlist. api.anthropic.com: any method. deb.debian.org and
-# security.debian.org: GET/HEAD (apt). registry.npmjs.org: GET (npm).
+# The allowlist. api.anthropic.com: any method. archive/security.ubuntu.com
+# (the VM's apt) and images.linuxcontainers.org (Incus images): GET/HEAD.
+# deb.debian.org and security.debian.org: GET/HEAD (apt in the container).
+# registry.npmjs.org: GET (npm).
 # pypi.org and files.pythonhosted.org: GET (pip). github.com: GET/HEAD
 # plus the POST that git clone/fetch needs (git-upload-pack) - so
 # ordinary reads and clones work, but push (git-receive-pack) does not.
@@ -34,6 +35,7 @@ block_list:
 - >-
   ;!(
   ~d "^api\.anthropic\.com$"
+  | ( ~d "^(archive\.ubuntu\.com|security\.ubuntu\.com|images\.linuxcontainers\.org)$" & ~m "^(GET|HEAD)$" )
   | ( ~d "^(deb\.debian\.org|security\.debian\.org)$" & ~m "^(GET|HEAD)$" )
   | ( ~d "^registry\.npmjs\.org$" & ~m "^GET$" )
   | ( ~d "^(pypi\.org|files\.pythonhosted\.org)$" & ~m "^GET$" )
