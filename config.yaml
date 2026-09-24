@@ -1,0 +1,54 @@
+# This is mitmproxy's own config file (mitmdump --set confdir=<dir> reads
+# it as <dir>/config.yaml). No custom code: the allowlist below is plain
+# mitmproxy options.
+#
+# block_list holds ONE rule: a filter matching everything NOT allowed, so
+# it reads "block everything except (...)". Filters: ~d "regex" is the
+# request's host (anchor ^ $; \. for a literal dot; "(^|\.)example\.com$"
+# for subdomains), ~m "regex" the method, ~u "regex" the full URL
+# (scheme+host+path+query), ~bq "regex" the request body. Combine with
+# & | ! and parentheses; quote any regex that itself contains parentheses.
+# Whitespace/newlines inside the filter are ignored.
+#
+# Tokens: modify_headers injects a header into matching requests, no code
+# needed (examples below). Edit this file on the host; mitmdump notices
+# and restarts within a few seconds. A blocked request gets a plain 403
+# and a line in ~/.config/ssbx/proxy.log ("<< HTTP/1.1 403 Forbidden").
+
+listen_host: 127.0.0.1
+listen_port: 8080
+connection_strategy: lazy
+upstream_cert: false
+rawtcp: false
+termlog_verbosity: warn
+
+# A corporate upstream proxy for all of ssbx's own traffic:
+#mode: upstream:http://proxy:3128
+
+# The allowlist. api.anthropic.com: any method. deb.debian.org and
+# security.debian.org: GET/HEAD (apt). registry.npmjs.org: GET (npm).
+# pypi.org and files.pythonhosted.org: GET (pip). github.com: GET/HEAD
+# plus the POST that git clone/fetch needs (git-upload-pack) - so
+# ordinary reads and clones work, but push (git-receive-pack) does not.
+block_list:
+- >-
+  ;!(
+  ~d "^api\.anthropic\.com$"
+  | ( ~d "^(deb\.debian\.org|security\.debian\.org)$" & ~m "^(GET|HEAD)$" )
+  | ( ~d "^registry\.npmjs\.org$" & ~m "^GET$" )
+  | ( ~d "^(pypi\.org|files\.pythonhosted\.org)$" & ~m "^GET$" )
+  | ( ~d "^github\.com$" & ( ~m "^(GET|HEAD)$" | ~u "git-upload-pack" ) )
+  );403
+
+# To also allow git push to github.com, add this arm to the OR list above:
+#  | ( ~d "^github\.com$" & ~u "git-receive-pack" )
+
+# Path-restricted example: read everything on a Confluence host, but only
+# allow posting comments (add as another "| (...)" arm above):
+#  | ( ~d "^example\.atlassian\.net$" & ( ~m "^(GET|HEAD)$" | ( ~m "^POST$" & ~u "/comment" ) ) )
+
+# Tokens: inject a header into requests matching a filter, no code needed.
+# (Also add the host to the block_list allowlist above, or these never fire.)
+#modify_headers:
+#- "/~d \"^gitlab\.example\.com$\"/PRIVATE-TOKEN/glpat-xxxxxxxxxxxxxxxxxxxx"
+#- "/~d \"^api\.github\.com$\"/Authorization/Bearer github_pat_xxxxxxxxxxxxxxxx"

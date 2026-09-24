@@ -1,160 +1,109 @@
-# ssbx: a bare Debian VM that can only reach the hosts you allow. It has no
-# agent of its own - install Claude Code, Codex, or whatever you use inside
-# it, through the proxy, and mount that agent's config folder below.
-# The allowlist proxy runs inside this VM as a systemd service.
-#
-#   limactl start ~/ssbx/ssbx.yaml
-#   limactl shell ssbx
-#
-# Everything is in this one file. Edit it, then: limactl stop ssbx && limactl start ssbx
+# ssbx: a bare Debian VM that can only reach the hosts you allow. No agent
+# of its own - install Claude Code, Codex, etc. inside it, through the
+# proxy, and mount that agent's config folder below. The allowlist proxy
+# runs as a systemd service, configured by ~/.config/ssbx/config.yaml.
+#   limactl start template:ssbx && limactl shell ssbx
 minimumLimaVersion: "2.0.0"
-
 base:
 - template:_images/debian-13
-
-# cpus is an upper bound shared with the host; memory stays taken for as
-# long as the VM runs. Raise memory if the VM swaps a lot during builds.
+# cpus/memory/disk: edit to taste (cpus is a shared upper bound; memory
+# stays taken as long as the VM runs). qemu on Linux, vz on macOS - Lima's
+# own default, left unset here.
 cpus: 4
 memory: "2GiB"
 disk: "60GiB"
-
-# qemu on Linux, vz on macOS - Lima's own default, left unset here.
-
-# Linux needs the virtiofsd package (Arch: pacman -S virtiofsd, Debian: apt
-# install virtiofsd) for this; without it, change to "9p" (slower).
+# Needs the virtiofsd package (Arch: pacman -S virtiofsd, Debian: apt
+# install virtiofsd); without it, change to "9p" (slower).
 mountType: virtiofs
 mountInotify: false
-
-# Your projects, and the proxy's config and log - writable, at the same
-# paths as on your machine.
+# Your projects, and the proxy's config/log - writable, same paths as on
+# your machine. Add more folders, or the agent's own config folder so its
+# login/settings are shared, e.g.:
 mounts:
-- location: "~/Work"        # your projects; add more folders here
+- location: "~/Work"
   writable: true
 - location: "~/.config/ssbx"
   writable: true
-# Mount the config folder of the agent you use so its login and settings
-# are shared with your machine, e.g.:
 #- location: "~/.claude"
 #  writable: true
 #- location: "~/.codex"
 #  writable: true
-
+# The guest is always Debian, so /home/<user> matches a Linux host's home.
+# On a macOS host (/Users/<user>) change this to match.
 user:
-  # The guest is always Debian, so /home/<user> matches a Linux host's own
-  # home. On a macOS host (/Users/<user>) change this line to match, so
-  # that a mount above lands at the same path inside the VM.
   home: "/home/{{.User}}"
-
 containerd:
   system: false
   user: false
-
-# The proxy listens on 127.0.0.1:8080 inside the VM only; nothing here is
-# exposed on your machine.
+# The proxy listens on 127.0.0.1:8080 inside the VM only; nothing exposed.
 portForwards:
 - guestPort: 8080
   ignore: true
-
-# Lima rewrites a loopback address in HTTP_PROXY/etc. here to the host's
-# gateway IP, which is wrong for a proxy that lives inside this VM - so the
-# proxy env is written straight into /etc/environment below instead.
+# Lima rewrites a loopback address in its own env: field to the host's
+# gateway IP - wrong for a proxy inside this VM, so it's written straight
+# into /etc/environment below instead.
 propagateProxyEnv: false
-
 provision:
 - mode: system
   script: |
     #!/bin/bash
-    # Runs as root, at every boot; has to be safe to run again. {{.Home}} is
-    # this VM's home, the one mounted from your machine.
+    # Runs as root, every boot; must be safe to run again. {{.Home}} is this
+    # VM's home, the one mounted from your machine.
     set -eu -o pipefail
     export DEBIAN_FRONTEND=noninteractive
-
-    HOME_DIR="{{.Home}}"
-    TOML="$HOME_DIR/.config/ssbx/ssbx.toml"
-    MARK=/var/lib/ssbx
-    mkdir -p "$MARK"
-    say() { echo "ssbx: $*"; }
-
-    # An optional upstream proxy in ssbx.toml, used for the installs below
-    # and passed to the proxy itself further down.
-    UPSTREAM=""
-    if command -v python3 >/dev/null && [ -f "$TOML" ]; then
-      UPSTREAM="$(python3 -c '
-    import tomllib, sys
-    try:
-        with open(sys.argv[1], "rb") as f:
-            print(tomllib.load(f).get("proxy") or "")
-    except Exception:
-        print("")
-    ' "$TOML" 2>/dev/null || true)"
-    fi
-    if [ -n "$UPSTREAM" ]; then
-      export http_proxy="$UPSTREAM" https_proxy="$UPSTREAM"
-    fi
-
-    # --- the base packages and the proxy's own venv: once ---------------------
-    if [ ! -f "$MARK/installed" ]; then
+    HOME_DIR="{{.Home}}"; CONFDIR=/var/lib/ssbx; LOG="$HOME_DIR/.config/ssbx/proxy.log"
+    mkdir -p "$CONFDIR"; say() { echo "ssbx: $*"; }
+    # packages and the proxy's own venv, before the firewall: once -----------
+    if [ ! -f "$CONFDIR/installed" ]; then
       say "installing packages"
-      apt-get update -q
-      apt-get install -y -q --no-install-recommends \
+      apt-get update -q && apt-get install -y -q --no-install-recommends \
         git curl ca-certificates python3 python3-venv nftables
-      python3 -m venv /opt/mitm
-      /opt/mitm/bin/pip install --quiet mitmproxy
-      touch "$MARK/installed"
+      python3 -m venv /opt/mitm && /opt/mitm/bin/pip install --quiet mitmproxy
+      touch "$CONFDIR/installed"
     fi
-
-    # --- swap: memory stays small; this keeps a big build from OOM-killing ---
+    # config.yaml lives on the host; the VM only ever sees a symlink to it ---
+    ln -sfn "$HOME_DIR/.config/ssbx/config.yaml" "$CONFDIR/config.yaml"
+    # swap: memory stays small; this keeps a big build from OOM-killing ------
     if [ ! -f /swapfile ]; then
-      say "creating a 2G swapfile"
       fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
-      chmod 600 /swapfile
-      mkswap /swapfile >/dev/null
-      echo '/swapfile none swap sw 0 0' >> /etc/fstab
+      chmod 600 /swapfile && mkswap /swapfile >/dev/null && echo '/swapfile none swap sw 0 0' >> /etc/fstab
     fi
     swapon --show=NAME --noheadings 2>/dev/null | grep -qx /swapfile || swapon /swapfile
-
-    # --- the proxy, as a systemd service --------------------------------------
-    MODE_FLAG=""
-    [ -n "$UPSTREAM" ] && MODE_FLAG="--mode upstream:$UPSTREAM"
+    # the proxy, as a systemd service. mitmdump does not reload config.yaml on
+    # its own, so ExecStart backgrounds it and polls the file's mtime every 3s;
+    # a change kills mitmdump and Restart=always starts a fresh one that reads
+    # the new file. Both streams append to the host's proxy.log.
     cat > /etc/systemd/system/ssbx-proxy.service <<UNIT
     [Unit]
     Description=ssbx allowlist proxy
     After=network.target
-
     [Service]
     Type=simple
+    ExecStart=/bin/sh -c '/opt/mitm/bin/mitmdump --set confdir=$CONFDIR & p=\$!; m0=\$(stat -Lc %Y $CONFDIR/config.yaml 2>/dev/null||echo 0); while kill -0 \$p 2>/dev/null; do sleep 3; m1=\$(stat -Lc %Y $CONFDIR/config.yaml 2>/dev/null||echo 0); [ "\$m1" != "\$m0" ] && kill \$p; done; wait \$p'
     Restart=always
-    ExecStart=/opt/mitm/bin/mitmdump -q --listen-host 127.0.0.1 -p 8080 --set confdir=$MARK -s $HOME_DIR/.config/ssbx/proxy.py --set ssbx_config=$TOML $MODE_FLAG
-
+    RestartSec=3
+    StartLimitIntervalSec=0
+    StandardOutput=append:$LOG
+    StandardError=append:$LOG
     [Install]
     WantedBy=multi-user.target
     UNIT
     systemctl daemon-reload
     systemctl enable ssbx-proxy.service >/dev/null 2>&1 || true
     systemctl restart ssbx-proxy.service
-
-    # --- the proxy's certificate, so intercepted hosts (incl. apt's) verify --
+    # the proxy's certificate, so intercepted hosts (incl. apt's) verify -----
     say "waiting for the proxy's certificate"
-    for _ in $(seq 1 60); do
-      [ -s "$MARK/mitmproxy-ca-cert.pem" ] && break
-      sleep 1
-    done
-    if [ ! -s "$MARK/mitmproxy-ca-cert.pem" ]; then
-      say "the proxy did not produce a certificate; see: journalctl -u ssbx-proxy"
-      exit 1
-    fi
-    if ! cmp -s "$MARK/mitmproxy-ca-cert.pem" /usr/local/share/ca-certificates/ssbx.crt 2>/dev/null; then
-      cp "$MARK/mitmproxy-ca-cert.pem" /usr/local/share/ca-certificates/ssbx.crt
+    for _ in $(seq 1 60); do [ -s "$CONFDIR/mitmproxy-ca-cert.pem" ] && break; sleep 1; done
+    [ -s "$CONFDIR/mitmproxy-ca-cert.pem" ] || { say "no certificate; see: journalctl -u ssbx-proxy"; exit 1; }
+    if ! cmp -s "$CONFDIR/mitmproxy-ca-cert.pem" /usr/local/share/ca-certificates/ssbx.crt 2>/dev/null; then
+      cp "$CONFDIR/mitmproxy-ca-cert.pem" /usr/local/share/ca-certificates/ssbx.crt
       update-ca-certificates >/dev/null
     fi
-
-    # --- apt, npm, PAM sessions and login shells all go through the proxy ----
-    printf 'Acquire::http::Proxy "http://127.0.0.1:8080";\nAcquire::https::Proxy "http://127.0.0.1:8080";\n' \
-      > /etc/apt/apt.conf.d/90ssbx
+    # apt, npm, PAM sessions and login shells all go through the proxy ------
+    printf 'Acquire::http::Proxy "http://127.0.0.1:8080";\nAcquire::https::Proxy "http://127.0.0.1:8080";\n' > /etc/apt/apt.conf.d/90ssbx
     printf 'proxy=http://127.0.0.1:8080\nhttps-proxy=http://127.0.0.1:8080\n' > /etc/npmrc
     if ! grep -q '^# ssbx$' /etc/environment 2>/dev/null; then
       cat >> /etc/environment <<'ENVF'
-
     # ssbx
     HTTP_PROXY=http://127.0.0.1:8080
     HTTPS_PROXY=http://127.0.0.1:8080
@@ -165,23 +114,16 @@ provision:
     NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
     ENVF
     fi
-    # /etc/environment only reaches interactive/login sessions on this image;
-    # this covers `limactl shell ssbx -- ...` (no login shell) too.
+    # also in profile.d: /etc/environment skips non-login shells, which is
+    # how `limactl shell ssbx -- ...` runs.
     cat > /etc/profile.d/ssbx.sh <<'PROFILE'
-    export HTTP_PROXY=http://127.0.0.1:8080 HTTPS_PROXY=http://127.0.0.1:8080
-    export http_proxy=http://127.0.0.1:8080 https_proxy=http://127.0.0.1:8080
-    export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-    export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
-    export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+    export HTTP_PROXY=http://127.0.0.1:8080 HTTPS_PROXY=http://127.0.0.1:8080 http_proxy=http://127.0.0.1:8080 https_proxy=http://127.0.0.1:8080
+    export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
     PROFILE
-    echo 'Defaults env_keep += "HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY SSL_CERT_FILE NODE_EXTRA_CA_CERTS REQUESTS_CA_BUNDLE"' \
-      > /etc/sudoers.d/ssbx
-    chmod 440 /etc/sudoers.d/ssbx
-
-    # --- firewall: every uid, root included, may reach only the proxy --------
-    # (DNS is let through for everyone: systemd-resolved forwards it and runs
-    # as its own non-root user, and a hostname alone grants no access - the
-    # proxy and this firewall still gate every actual connection.)
+    echo 'Defaults env_keep += "HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY SSL_CERT_FILE NODE_EXTRA_CA_CERTS REQUESTS_CA_BUNDLE"' > /etc/sudoers.d/ssbx && chmod 440 /etc/sudoers.d/ssbx
+    # firewall: every uid, root included, may reach only the proxy. DNS is let
+    # through for everyone; a hostname alone grants no access - the proxy and
+    # this firewall gate every actual connection.
     cat > /etc/nftables.conf <<'NFT'
     #!/usr/sbin/nft -f
     flush ruleset
@@ -197,10 +139,7 @@ provision:
       }
     }
     NFT
-    nft -f /etc/nftables.conf
-
-    say "ready"
-
+    nft -f /etc/nftables.conf && say "ready"
 probes:
 - description: "the ssbx proxy to be listening on 127.0.0.1:8080"
   script: |
