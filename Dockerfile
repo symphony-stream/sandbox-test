@@ -65,22 +65,22 @@ RUN HOME=/tmp/claude-install bash -c "curl -fsSL https://claude.ai/install.sh | 
     && cp -L /tmp/claude-install/.local/bin/claude /usr/local/bin/claude \
     && rm -rf /tmp/claude-install
 
-# The audit hook and the settings sync (see sandbox/), and the managed
-# settings that wire the hook into Claude Code. Managed settings win over
-# everything else, so the log stays on whatever the settings inside say. The
-# ssbx script adds a drop-in with the permission mode from your config.
-COPY sandbox/audit-hook sandbox/sync /opt/ssbx/
+# The audit hook (see sandbox/) and the managed settings that wire it into
+# Claude Code. Managed settings win over everything else, so the log stays on
+# whatever the settings inside say. The ssbx script adds a drop-in with the
+# permission mode from your config.
+COPY sandbox/audit-hook /opt/ssbx/
 COPY sandbox/managed-settings.json /etc/claude-code/managed-settings.json
 RUN python3 -m json.tool /etc/claude-code/managed-settings.json >/dev/null \
-    && chmod 755 /opt/ssbx/audit-hook /opt/ssbx/sync \
+    && chmod 755 /opt/ssbx/audit-hook \
     && mkdir -p /etc/claude-code/managed-settings.d \
     && chmod 755 /etc/claude-code /etc/claude-code/managed-settings.d \
     && chmod 644 /etc/claude-code/managed-settings.json
 
 # The sandbox user is you: same name, uid and home path as on your machine, so
 # files it creates in the project are yours, and paths inside your Claude
-# settings keep working. Its home is the ssbx-home volume: login, settings
-# and shell history stay there between runs.
+# settings keep working. Its home is the ssbx-home volume, with your own
+# ~/.claude mounted into it by the ssbx script.
 ARG UID=1000
 ARG GID=1000
 ARG USER_NAME=agent

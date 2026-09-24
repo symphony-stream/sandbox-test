@@ -13,28 +13,30 @@
 #   ssbx stop            stop the VM (needed after changing mounts, cpus, memory, disk)
 #
 # How it works: a Colima VM runs two containers. The sandbox container gets the
-# project you started it in, and nothing else. Its only way out is the proxy
-# container, which keeps your tokens, lets only read requests through to
-# GitLab, Jira and the other hosts in your hosts file, and writes the audit
-# log. Settings come from ~/.config/ssbx/config (see config.example).
+# project you started it in and your ~/.claude, nothing else. Its only way out
+# is the proxy container, which keeps your tokens, lets only read requests
+# through to GitLab, Jira and the other hosts in your hosts file, and writes
+# the audit log. Settings come from the config file in Colima's ssbx profile
+# folder (`ssbx status` says where; see config.example).
 #
 # Works with the bash that ships with macOS (3.2) and with Linux.
 
 set -euo pipefail
+unset CDPATH
 
 
 # ------------------------------------------------------------- settings
 #
-# Defaults. ~/.config/ssbx/config overrides them; config.example explains each.
+# Defaults. The config file overrides them; config.example explains each.
+# It lives with the hosts file in the ssbx profile folder of Colima, next to
+# the VM's colima.yaml: ~/.config/colima/ssbx on Linux, ~/.colima/ssbx on
+# macOS, $COLIMA_HOME/ssbx if that is set. Found the same way Colima finds it.
 
 proxy="${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}"
 mounts=("$HOME")
 cpus=4
 memory=8
 disk=60
-sync=(settings.json CLAUDE.md skills agents commands rules hooks output-styles themes keybindings.json plugins)
-sync_mcp=true
-sync_login=false
 permission_mode=""
 env=()
 packages=()
@@ -42,9 +44,21 @@ docker_options=()
 log_file="$HOME/.local/state/ssbx/audit.jsonl"
 log="all"
 
-config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ssbx"
+if [ -n "${COLIMA_HOME:-}" ]; then
+  colima_dir="$COLIMA_HOME"
+elif [ -d "$HOME/.colima" ]; then
+  colima_dir="$HOME/.colima"
+elif [ -n "${XDG_CONFIG_HOME:-}" ]; then
+  colima_dir="$XDG_CONFIG_HOME/colima"
+elif [ "$(uname -s)" = Darwin ]; then
+  colima_dir="$HOME/.colima"
+else
+  colima_dir="$HOME/.config/colima"
+fi
+config_dir="$colima_dir/ssbx"
 config_file="$config_dir/config"
 hosts_file="$config_dir/hosts"
+mkdir -p "$config_dir"
 
 if [ -f "$config_file" ]; then
   # shellcheck disable=SC1090
@@ -60,9 +74,12 @@ if [ -n "$proxy" ]; then
   proxy_scheme="${proxy%%"$proxy_rest"}"
   proxy_hostport="${proxy_rest##*@}"
   proxy_userinfo="${proxy_rest%"$proxy_hostport"}"
-  proxy_hostport="${proxy_hostport/#127.0.0.1/host.docker.internal}"
-  proxy_hostport="${proxy_hostport/#localhost/host.docker.internal}"
-  proxy="$proxy_scheme$proxy_userinfo$proxy_hostport"
+  proxy_host="${proxy_hostport%%[:/]*}"
+  proxy_port="${proxy_hostport#"$proxy_host"}"
+  case "$proxy_host" in
+    localhost | 127.0.0.1) proxy_host=host.docker.internal ;;
+  esac
+  proxy="$proxy_scheme$proxy_userinfo$proxy_host$proxy_port"
 fi
 
 # The audit log, the drop-in with the permission mode and a note of how the VM
@@ -217,15 +234,27 @@ if [ "$command" != rebuild ]; then
   done
 fi
 
+# Your ~/.claude goes into the sandbox as well (see "your settings" below), so
+# the VM has to see it too, and the folder the log is written to.
+if [ ! -d "$home_dir/.claude" ]; then
+  mkdir -p "$home_dir/.claude"
+  chmod 700 "$home_dir/.claude"
+fi
+claude_dir="$(cd "$home_dir/.claude" && pwd -P)"
+
 mount_options=()
 project_mounted=false
 state_mounted=false
+claude_mounted=false
+home_mounted=false
 for dir in ${mounts[@]+"${mounts[@]}"}; do
   [ -d "$dir" ] || die "mount $dir from the config does not exist"
   dir="$(cd "$dir" && pwd -P)"
   mount_options+=(--mount "$dir:w")
   case "$project_dir" in "$dir" | "$dir"/*) project_mounted=true ;; esac
   case "$state_dir" in "$dir" | "$dir"/*) state_mounted=true ;; esac
+  case "$claude_dir" in "$dir" | "$dir"/*) claude_mounted=true ;; esac
+  [ "$dir" = "$home_dir" ] && home_mounted=true
 done
 if [ "$command" != rebuild ] && [ "$project_mounted" = false ]; then
   die "$project_dir is outside the folders the sandbox can see (mounts in $config_file: ${mounts[*]+${mounts[*]}})"
@@ -235,6 +264,9 @@ mkdir -p "$state_dir"
 chmod 700 "$state_dir"
 if [ "$state_mounted" = false ]; then
   mount_options+=(--mount "$state_dir:w")
+fi
+if [ "$claude_mounted" = false ]; then
+  mount_options+=(--mount "$claude_dir:w")
 fi
 
 
@@ -285,13 +317,21 @@ if [ "$state" = Running ]; then
     die "the VM is running with older settings (mounts, cpus, memory or disk changed). Run: ssbx stop"
   fi
 else
+  # Colima reads --env as a comma-separated list, so a comma in the proxy
+  # password goes in as %2C, which every client decodes again.
+  colima_env=()
+  if [ -n "$proxy" ]; then
+    vm_proxy="${proxy//,/%2C}"
+    colima_env=(--env "HTTP_PROXY=$vm_proxy" --env "HTTPS_PROXY=$vm_proxy"
+                --env "http_proxy=$vm_proxy" --env "https_proxy=$vm_proxy")
+  fi
   env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u NO_PROXY -u no_proxy \
     ${proxy_on_host:+HTTP_PROXY="$proxy_on_host" HTTPS_PROXY="$proxy_on_host"} \
     colima start --profile "$profile" \
       --runtime docker --kubernetes=false \
       --cpus "$cpus" --memory "$memory" --disk "$disk" \
       "${mount_options[@]}" \
-      --env "HTTP_PROXY=$proxy,HTTPS_PROXY=$proxy,http_proxy=$proxy,https_proxy=$proxy" \
+      ${colima_env[@]+"${colima_env[@]}"} \
       --activate=false --ssh-config=false
   printf '%s' "$vm_config" > "$state_dir/vm"
 fi
@@ -318,7 +358,7 @@ esac
 [ "$uid" != 0 ] || die "do not run this as root"
 
 build_inputs="$(for f in "$script_dir/Dockerfile" "$script_dir"/proxy/* "$script_dir"/sandbox/*; do
-  [ -f "$f" ] && cat "$f"
+  [ -f "$f" ] && { printf '%s %s\n' "${f#"$script_dir"/}" "$(wc -c < "$f")"; cat "$f"; }
 done | cksum | cut -d ' ' -f 1)"
 build_id="$build_inputs-$uid-$gid-$user_name-$HOME-${packages[*]+${packages[*]}}"
 
@@ -340,9 +380,9 @@ build() {
     docker tag ssbx-proxy:previous ssbx-proxy >/dev/null 2>&1 || true
     die "the sandbox image did not build"
   fi
-  docker rmi ssbx-proxy:previous >/dev/null 2>&1 || true
   # The running proxy still has the old certificate. It starts again below.
   docker rm --force --volumes ssbx-proxy >/dev/null 2>&1 || true
+  docker rmi ssbx-proxy:previous >/dev/null 2>&1 || true
 }
 
 image_build() {
@@ -420,28 +460,22 @@ fi
 
 # ------------------------------------------------------------- your settings
 #
-# Your Claude Code settings go into the sandbox before every session: the items
-# from `sync`, your MCP servers and the settings of this project. A throwaway
-# container with the sandbox's home directory receives them as a tar stream
-# and installs them (see sandbox/sync). The login is only copied if you ask.
+# Your ~/.claude and ~/.claude.json are mounted into the sandbox, not copied:
+# login, settings, skills, plugins, MCP servers, history and the transcripts
+# of the sessions run inside are the same files as on your machine. (On macOS
+# the login is in the Keychain, which the sandbox cannot see: log in once
+# inside, the file Claude writes then stays in the mounted folder.) Colima
+# mounts folders, not files, so ~/.claude.json can only be shared when your
+# home directory is one of the mounts.
 
-sync_items=()
-for item in ${sync[@]+"${sync[@]}"}; do
-  [ -e "$HOME/.claude/$item" ] && sync_items+=(".claude/$item")
-done
-if [ "$sync_login" = true ] && [ -f "$HOME/.claude/.credentials.json" ]; then
-  sync_items+=(.claude/.credentials.json)
+claude_options=(--volume "$claude_dir:$HOME/.claude")
+if [ ! -f "$home_dir/.claude.json" ]; then
+  echo "ssbx: there is no ~/.claude.json on your machine yet, so the sandbox keeps its own until there is" >&2
+elif [ "$home_mounted" = false ]; then
+  echo "ssbx: ~/.claude.json is not shared with the sandbox, because your home directory is not in mounts" >&2
+else
+  claude_options+=(--volume "$home_dir/.claude.json:$HOME/.claude.json")
 fi
-[ -f "$HOME/.claude.json" ] && sync_items+=(.claude.json)
-
-{ if [ "${#sync_items[@]}" -gt 0 ]; then tar -c -h -C "$HOME" -f - "${sync_items[@]}" 2>/dev/null || true; fi; } \
-  | docker run --rm --interactive --network none \
-      --volume "ssbx-home:$HOME" \
-      --env "HOME=$HOME" \
-      --env "SSBX_PROJECT=$project_dir" \
-      --env "SSBX_SYNC=${sync[*]+${sync[*]}}" \
-      --env "SSBX_SYNC_MCP=$sync_mcp" \
-      ssbx /usr/bin/python3 -I /opt/ssbx/sync
 
 # The permission mode from the config, as a managed setting no settings file
 # inside can override, and what the audit hook should report. Mounted
@@ -493,9 +527,10 @@ fi
 #
 # --cap-drop ALL and no-new-privileges: nobody inside can become root.
 # The ssbx-home volume is the home directory inside, at the same path as on
-# your machine. The project is mounted at the same path it has on your
-# machine, too. The proxy variables are given again here: a proxies section
-# in ~/.docker/config.json would otherwise replace the ones from the image.
+# your machine, with your ~/.claude and the project mounted into it at the
+# paths they have on your machine. The proxy variables are given again here:
+# a proxies section in ~/.docker/config.json would otherwise replace the ones
+# from the image.
 
 run_options=(
   --rm --interactive --init
@@ -504,6 +539,7 @@ run_options=(
   --cap-drop ALL
   --security-opt no-new-privileges
   --volume "ssbx-home:$HOME"
+  "${claude_options[@]}"
   --volume "$project_dir:$project_dir"
   --volume "$state_dir/managed.json:/etc/claude-code/managed-settings.d/50-ssbx.json:ro"
   --workdir "$current_dir"

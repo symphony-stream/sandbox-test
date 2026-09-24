@@ -1,5 +1,6 @@
-# Copy this file to ~/.config/ssbx/hosts and fill in your tokens.
-# After editing it, run `ssbx reload`.
+# Copy this file into the ssbx profile folder of Colima, next to the config
+# (~/.config/colima/ssbx/hosts on Linux, ~/.colima/ssbx/hosts on macOS), and
+# fill in your tokens. After editing it, run `ssbx reload`.
 #
 # Each line is:   host   kind   token
 #

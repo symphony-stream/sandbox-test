@@ -33,8 +33,10 @@ import ipaddress
 import json
 import os
 import re
+import socket
 import sys
 import time
+import urllib.parse
 from datetime import datetime, timezone
 
 from mitmproxy import ctx, http, tls
@@ -164,6 +166,24 @@ JIRA_SEARCH = re.compile(r"^(/[A-Za-z0-9._~-]+)?/rest/api/(2|3|latest)/(search(/
 
 GRAPHQL_MUTATION = re.compile(r"\bmutation\b")
 
+
+def graphql_reads_only(body):
+    """True if the body is a GraphQL request (one or a batch) with queries only.
+    The JSON is decoded first, so \\u006dutation does not slip through."""
+    try:
+        document = json.loads(body)
+    except ValueError:
+        return False
+    operations = document if isinstance(document, list) else [document]
+    if not operations:
+        return False
+    for operation in operations:
+        if not isinstance(operation, dict) or not isinstance(operation.get("query"), str):
+            return False
+        if GRAPHQL_MUTATION.search(operation["query"]):
+            return False
+    return True
+
 # Endpoints that turn the token into other credentials.
 CREDENTIAL_PATHS = ("/jwt/", "/oauth/", "/-/", "/login", "/session", "/users/sign_in")
 
@@ -173,20 +193,28 @@ def why_blocked(request, kind):
     path = request.path.split("?", 1)[0]
     method = request.method
 
-    if request.scheme != "https":
-        return "the token only travels over HTTPS"
+    if request.scheme != "https" or request.port != 443:
+        return "the token only travels over HTTPS on port 443"
 
     if "upgrade" in request.headers.get("Connection", "").lower() or "Upgrade" in request.headers:
         return "WebSockets are not allowed"
 
-    if not PLAIN_PATH.match(path) or "/../" in path + "/" or "/./" in path + "/":
+    # The server decodes %XX before it looks at the path, so the checks look
+    # at both spellings.
+    decoded = urllib.parse.unquote(path)
+    if not PLAIN_PATH.match(path) or "\\" in decoded or any(ord(c) < 32 for c in decoded):
         return "unusual path"
-
-    if path.startswith(CREDENTIAL_PATHS) or "/jwt/" in path or "/oauth/" in path:
-        return "that endpoint hands out credentials"
+    for p in (path, decoded):
+        if "/../" in p + "/" or "/./" in p + "/":
+            return "unusual path"
+        if p.startswith(CREDENTIAL_PATHS) or "/jwt/" in p or "/oauth/" in p:
+            return "that endpoint hands out credentials"
 
     if "git-receive-pack" in request.path:
         return "git push is not allowed"
+
+    if decoded == "/graphql" and method != "POST":
+        return "GraphQL only over POST"
 
     if method in ("GET", "HEAD"):
         return None
@@ -215,6 +243,10 @@ def is_private_name(host):
     try:
         return not ipaddress.ip_address(host).is_global
     except ValueError:
+        pass
+    try:  # 127.1, 0177.0.0.1, 0x7f000001: the old spellings of an IPv4 address
+        return not ipaddress.ip_address(socket.inet_ntoa(socket.inet_aton(host))).is_global
+    except OSError:
         return False
 
 
@@ -273,6 +305,8 @@ class ReadOnly:
         # A CONNECT from the sandbox: an HTTPS (or other TLS) tunnel is asked for.
         host, port = flow.request.host.lower(), flow.request.port
         if host in TOKENS:
+            if port != 443:
+                self.block(flow, "the token only travels over HTTPS on port 443")
             return
         if host == AUDIT_HOST:
             self.block(flow, "events are posted as plain HTTP")
@@ -364,7 +398,7 @@ class ReadOnly:
         elif flow.metadata.get("ssbx_graphql"):
             # A GraphQL document that writes has to say "mutation".
             body = flow.request.get_text(strict=False) or ""
-            if GRAPHQL_MUTATION.search(body):
+            if not graphql_reads_only(body):
                 flow.request.headers.pop("Authorization", None)
                 self.block(flow, "a GraphQL mutation would change something, only reading is allowed")
             else:
