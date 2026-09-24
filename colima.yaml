@@ -1,5 +1,6 @@
-# ssbx: a Colima VM with an Incus container inside, whose only way out is an
-# allowlist proxy (plain mitmproxy, configured by ~/.config/ssbx/config.yaml).
+# ssbx: a Colima VM, an Incus network inside it with no route out, the
+# allowlist proxy (plain mitmproxy, ~/.config/ssbx/config.yaml) listening on
+# that network, and an Incus container whose only way out is the proxy.
 # Every Colima setting is listed; the ones that matter for ssbx are commented.
 #
 #   mkdir -p ~/sandbox ~/.config/ssbx ~/.colima/ssbx
@@ -91,17 +92,21 @@ provision:
       done
       systemctl try-restart incus.service || true
 
-  # Once Incus is up: the container profile, then the container itself
-  # (created on the first start, just started afterwards).
+  # Once Incus is up: an isolated Incus network (no routing, no NAT: the
+  # container reaches only the VM on it, where the proxy listens), the
+  # container profile, then the container itself (created on the first
+  # start, just started afterwards).
   - mode: ready
     script: |
       set -eu
       USER_NAME=$(basename "$(ls -d /home/*.linux | head -1)" .linux)
       USER_UID=$(id -u "$USER_NAME")
       HOME_DIR=$(findmnt -rn -o TARGET | grep '/\.config/ssbx$' | head -1); HOME_DIR=${HOME_DIR%/.config/ssbx}
-      P=http://127.0.0.1:8080
+      P=http://10.10.10.1:8080
       for i in $(seq 60); do sudo -n incus info >/dev/null 2>&1 && break; sleep 2; done
       POOL=$(sudo -n incus storage list -f csv | head -1 | cut -d, -f1)
+      NET=$(sudo -n incus network list -f csv | grep ',bridge,' | head -1 | cut -d, -f1)
+      sudo -n incus network set "$NET" ipv4.address=10.10.10.1/24 ipv4.nat=false ipv4.routing=false ipv6.address=none
       sudo -n incus profile show ssbx >/dev/null 2>&1 || sudo -n incus profile create ssbx
       sudo -n incus profile edit ssbx <<EOF
       description: ssbx sandbox
@@ -115,8 +120,7 @@ provision:
         environment.https_proxy: $P
       devices:
         root: {type: disk, path: /, pool: $POOL}
-        # No network device at all: this proxy device is the only way out.
-        proxy: {type: proxy, listen: tcp:127.0.0.1:8080, connect: tcp:127.0.0.1:8080, bind: instance}
+        eth0: {type: nic, network: $NET}
         sandbox: {type: disk, source: $HOME_DIR/sandbox, path: $HOME_DIR/sandbox, shift: "true"}
         claude: {type: disk, source: $HOME_DIR/.claude, path: $HOME_DIR/.claude, shift: "true"}
       EOF

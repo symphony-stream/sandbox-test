@@ -15,7 +15,7 @@
 # and restarts within a few seconds. A blocked request gets a plain 403
 # and a line in ~/.config/ssbx/proxy.log ("<< HTTP/1.1 403 Forbidden").
 
-listen_host: 127.0.0.1
+listen_host: 0.0.0.0     # the container reaches the proxy over the Incus network
 listen_port: 8080
 connection_strategy: lazy
 upstream_cert: false
