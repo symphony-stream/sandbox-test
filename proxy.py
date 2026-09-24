@@ -1,21 +1,28 @@
 """
-ssbx proxy: the sandbox's only way out. Runs as `mitmdump --set
-confdir=... -s proxy.py`. Every request is checked against the [hosts]
-tables in ssbx.toml (format: see ssbx.example.toml) and refused unless an
-entry allows it. A host with only `allow = "*"` and no token is a tunnel,
-checked only for its CONNECT host and TLS SNI, then passed through end to
-end encrypted; every other host is intercepted with the proxy's own
-certificate, and a token, if any, is added to what is let through and
-stripped from the sandbox's own request. Every decision lands in
-SSBX_LOG_FILE, one JSON object per line; Claude Code inside reports its
-own events to http://ssbx.audit/.
+ssbx proxy: the sandbox's only way out. Runs inside the VM as `mitmdump -s
+proxy.py --set ssbx_config=~/.config/ssbx/ssbx.toml`, reloaded every 3 s.
+
+ssbx.toml:
+  proxy = "http://user:pass@host:port"   # optional upstream, for all traffic
+  log = "blocked"                        # or "all"; refusals always log
+  [hosts."name"]                         # exact host, or "*.name"
+  allow = "METHODS [PATH]"               # GET/POST/PUT/PATCH/DELETE/OPTIONS/
+                                          # git-fetch/git-push/graphql/*, path:
+                                          # * one segment, ** any, none = all
+  kind = "github"; token = "..."         # gitlab/github/atlassian/bearer
+  mutations = ["addComment"]             # allowed GraphQL mutation names
+
+`allow = "*"` with no token tunnels the connection (CONNECT host and TLS SNI
+checked, then passed through end to end encrypted); everything else is
+intercepted with this proxy's own certificate. Events go to proxy.log next
+to ssbx.toml, one JSON line each: blocked (always), allowed (log="all"),
+config_error, reload.
 """
 from __future__ import annotations
 import asyncio
 import base64
 import ipaddress
 import json
-import os
 import re
 import socket
 import sys
@@ -23,31 +30,26 @@ import tomllib
 import urllib.parse
 from collections import namedtuple
 from datetime import datetime, timezone
+from pathlib import Path
 try:  # everything below "addon" has no mitmproxy dependency, and is unit-tested without it
     from mitmproxy import ctx, http, tls
 except ImportError:
     ctx = http = tls = None
 
-CONFIG_FILE = os.environ.get("SSBX_CONFIG", "")
-LOG_FILE = os.environ.get("SSBX_LOG_FILE", "")
 LOG_MAX_BYTES = 20 * 1024 * 1024  # then the log is rotated once, to <name>.1
-AUDIT_HOST = "ssbx.audit"  # where the sandbox posts its events; never forwarded
-AUDIT_MAX_BYTES = 64 * 1024
 GRAPHQL_MAX_BYTES = 1024 * 1024
 METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
 SPECIAL = ("git-fetch", "git-push", "graphql", "*")
 KINDS = ("gitlab", "github", "atlassian", "bearer")
 # Names that are never a valid host for the sandbox, whatever the file says.
-RESERVED_NAMES = {"localhost", "host.lima.internal", "host.docker.internal", "ssbx.audit"}
+RESERVED_NAMES = {"localhost", "host.lima.internal", "host.docker.internal"}
 RESERVED_SUFFIXES = (".localhost", ".local", ".internal", ".lan", ".home", ".arpa", ".onion")
 LABEL = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$")
 ID_LIKE = re.compile(r"^(\d{2,}|[0-9a-fA-F]{8,}|[0-9a-fA-F-]{32,36})$")
 GRAPHQL_NAME = re.compile(r"[_A-Za-z][_0-9A-Za-z]*")
 
-
 class ConfigError(Exception):
     pass  # something in the [hosts] tables is wrong; the message says what
-
 
 Decision = namedtuple("Decision", "allowed reason rule suggest", defaults=("", None, None))
 
@@ -64,7 +66,6 @@ def is_ip_literal(name):  # 10.0.0.1, 127.1, 0x7f000001, ::1, ... - any IP spell
     labels = [label for label in bare.split(".") if label]
     return bool(labels) and all(re.fullmatch(r"0[xX][0-9a-fA-F]+|\d+", label) for label in labels)
 
-
 def normalize_host(name):  # lowercase, no trailing dot, punycode for non-ASCII names
     name = name.strip().rstrip(".").lower()
     try:
@@ -72,7 +73,6 @@ def normalize_host(name):  # lowercase, no trailing dot, punycode for non-ASCII 
         return name
     except UnicodeEncodeError:
         return name.encode("idna").decode("ascii")
-
 
 def check_host_name(name, where):
     if name.startswith("*."):
@@ -83,26 +83,19 @@ def check_host_name(name, where):
     if "*" in name or "." not in name or is_ip_literal(name) or name in RESERVED_NAMES or name.endswith(RESERVED_SUFFIXES) or not all(LABEL.match(label) for label in name.split(".")):
         raise ConfigError(f"{where}: {name!r} is not a host the sandbox can reach")
 
-
 def address_is_reachable(address):
-    # False for loopback/link-local/unspecified/multicast/reserved/the Lima subnet, and for any address
-    # that is one of this machine's own, even on an interface those ranges miss: a UDP socket can only
-    # bind() to an address actually configured here.
+    # False for loopback/link-local/unspecified/multicast/reserved, and for
+    # 192.168.5.0/24 - the Lima host subnet, where host.lima.internal (the
+    # user's own machine) lives.
     try:
         ip = ipaddress.ip_address(address)
     except ValueError:
         return False
     if ip.version == 6 and ip.ipv4_mapped:
         ip = ip.ipv4_mapped
-    if ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast or ip.is_reserved or (ip.version == 4 and ip in ipaddress.ip_network("192.168.5.0/24")):
+    if ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast or ip.is_reserved:
         return False
-    family = socket.AF_INET6 if ip.version == 6 else socket.AF_INET
-    try:
-        with socket.socket(family, socket.SOCK_DGRAM) as probe:
-            probe.bind((str(ip), 0))
-        return False  # bound: one of this machine's own addresses
-    except OSError:
-        return True
+    return not (ip.version == 4 and ip in ipaddress.ip_network("192.168.5.0/24"))
 
 # ------------------------------------------------------------------ paths
 def why_unusual_path(path):
@@ -122,7 +115,6 @@ def why_unusual_path(path):
         return "the path contains, or percent-decodes to, control characters, a backslash, //, or . / .."
     return None
 
-
 def normalize_path(path):  # the decoded path used for matching and logging; call why_unusual_path first
     path = path.split("?", 1)[0] or "/"
     try:
@@ -130,7 +122,6 @@ def normalize_path(path):  # the decoded path used for matching and logging; cal
     except UnicodeDecodeError:
         pass
     return path[:-1] if len(path) > 1 and path.endswith("/") else (path or "/")
-
 
 def compile_path(pattern, where):  # a rule path into a regex over decoded segments: "*" one, "**" any number
     if not pattern.startswith("/") or any(c in pattern for c in "?# \t\\") or "//" in pattern:
@@ -151,11 +142,9 @@ def compile_path(pattern, where):  # a rule path into a regex over decoded segme
 # ------------------------------------------------------------------ rules
 Rule = namedtuple("Rule", "text methods path regex")  # methods: a set of tokens; regex: compiled or None
 
-
 def rule_allows(rule, method, path):  # method is a request method, or git-fetch/git-push/graphql
     matches = rule.regex is None or rule.regex.match(normalize_path(path)) is not None
     return matches and ("*" in rule.methods or (method if method != "HEAD" else "GET") in rule.methods)
-
 
 def parse_rule(text, where):
     if not isinstance(text, str) or not text.strip():
@@ -175,7 +164,6 @@ def parse_rule(text, where):
     path = parts[1] if len(parts) == 2 else None
     return Rule(text, methods, path, compile_path(path, f"{where}: {text!r}") if path else None)
 
-
 class Host:
     def __init__(self, name, where):
         self.name, self.where = name, where
@@ -194,7 +182,6 @@ class Host:
 
     def allowing(self, method, path):
         return next((r for r in self.rules if rule_allows(r, method, path)), None)
-
 
 def load_rules(hosts_table):  # the [hosts] tables (a dict, as tomllib gives it) into a Rules object
     hosts_table = hosts_table or {}
@@ -238,7 +225,6 @@ def load_rules(hosts_table):  # the [hosts] tables (a dict, as tomllib gives it)
     wildcards.sort(key=lambda h: -len(h.name))  # the most specific wildcard first
     return Rules(exact, wildcards)
 
-
 class Rules:
     def __init__(self, exact, wildcards):
         self.exact, self.wildcards = exact, wildcards
@@ -274,7 +260,6 @@ class Rules:
             return Decision(False, f"{method} {normalize_path(path)} is not allowed on {entry.name}", suggest=suggest(host, method, path, git, graphql))
         return Decision(True, f"{method} {normalize_path(path)}", rule=rule.text)
 
-
 def decide_graphql(entry, host, method, path, graphql):
     if method != "POST":
         return Decision(False, "GraphQL is only allowed as POST")
@@ -296,10 +281,8 @@ def decide_graphql(entry, host, method, path, graphql):
                 return Decision(False, "GraphQL mutation " + ", ".join(refused or ["?"]) + f" is not allowed on {entry.name}", suggest=suggest(host, method, path, None, graphql))
     return Decision(True, f"graphql {path}", rule=rule.text)
 
-
 def mutation_allowed(entry, name):
     return any(pattern == name or ("*" in pattern and re.fullmatch(".*".join(re.escape(p) for p in pattern.split("*")), name)) for pattern in entry.mutations)
-
 
 def suggest(host, method, path, git=None, graphql=None):  # a ready-to-paste TOML snippet that would allow this request
     host = normalize_host(host)
@@ -317,7 +300,6 @@ def suggest(host, method, path, git=None, graphql=None):  # a ready-to-paste TOM
 
 # ------------------------------------------------------------------ git
 GIT_END = re.compile(r"^(?P<repo>/.+?)(?:\.git)?/(?P<what>info/refs|git-upload-pack|git-receive-pack)$")
-
 
 def git_request(method, path_with_query, content_type=""):  # (kind, repo) for git smart HTTP, else None
     path, _, query = path_with_query.partition("?")
@@ -341,7 +323,6 @@ def git_request(method, path_with_query, content_type=""):  # (kind, repo) for g
 def is_graphql_path(path):
     return normalize_path(path).rsplit("/", 1)[-1].lower() == "graphql"
 
-
 def graphql_operations(body, limit=1024 * 1024):
     # [(kind, [top-level field names])], kind being query, mutation, subscription, or unknown when the
     # document could not be read.
@@ -358,9 +339,7 @@ def graphql_operations(body, limit=1024 * 1024):
         operations.extend(parse_document(item["query"]))
     return operations
 
-
 TOKEN = re.compile(r"[_A-Za-z][_0-9A-Za-z]*|\.\.\.|[{}()]")
-
 
 def parse_document(text):
     # A light, token-level reading: a directive is skipped over rather than understood (can add a harmless
@@ -385,7 +364,6 @@ def parse_document(text):
         ops.append((keyword or "query", names))
     return ops or [("unknown", [])]
 
-
 def skip_block(tokens, i, open_, close):  # from an opening bracket token at i to past its matching close
     depth, n = 0, len(tokens)
     while i < n:
@@ -397,7 +375,6 @@ def skip_block(tokens, i, open_, close):  # from an opening bracket token at i t
                 return i + 1
         i += 1
     return n
-
 
 def top_level_fields(tokens, i):  # (names, index after) for tokens[i]=="{"; (None, ...) for a fragment spread
     i += 1
@@ -422,7 +399,6 @@ def top_level_fields(tokens, i):  # (names, index after) for tokens[i]=="{"; (No
 def basic_auth(user, password):
     return "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
 
-
 def auth_headers(kind, token, is_git):  # the header that carries the token, as each service expects it
     if kind == "gitlab":
         return {"Authorization": basic_auth("oauth2", token)} if is_git else {"PRIVATE-TOKEN": token}
@@ -436,43 +412,11 @@ def auth_headers(kind, token, is_git):  # the header that carries the token, as 
     raise ConfigError(f"unknown kind {kind!r}")
 
 # ==================================================================== addon
-def read_config():
-    try:
-        with open(CONFIG_FILE, "rb") as f:
-            config = tomllib.load(f)
-    except (OSError, tomllib.TOMLDecodeError) as e:
-        sys.exit(f"ssbx proxy: cannot read {CONFIG_FILE}: {e}")
-    try:
-        return load_rules(config.get("hosts")), config.get("log", "all")
-    except ConfigError as e:
-        sys.exit(f"ssbx proxy: {CONFIG_FILE}: {e}")
-
-
-RULES, LOG_MODE = read_config() if CONFIG_FILE else (load_rules(None), "all")  # empty ruleset when imported for testing
-
-
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
-
-def log_event(event):  # one JSON line appended to the audit log, rotated once past 20 MB
-    line = json.dumps({"ts": now(), **event}, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "replace") + b"\n"
-    if not LOG_FILE:
-        sys.stdout.buffer.write(line)
-        sys.stdout.flush()
-        return
-    try:
-        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
-            os.replace(LOG_FILE, LOG_FILE + ".1")
-        with open(LOG_FILE, "ab") as f:
-            f.write(line)
-    except OSError as e:
-        print(f"ssbx proxy: cannot write {LOG_FILE}: {e}", file=sys.stderr, flush=True)
-
-
 def upstream_mode():
     return bool(ctx.options.mode) and any(str(m).startswith("upstream:") for m in ctx.options.mode)
-
 
 async def resolve(host, port):
     # None, or the reason the proxy will not connect to host:port. With an upstream proxy the upstream
@@ -487,24 +431,76 @@ async def resolve(host, port):
     bad = [info[4][0] for info in infos if not address_is_reachable(info[4][0])]
     return f"{host} points at {bad[0]}, which is not reachable from the sandbox" if bad else None
 
-
 class Allowlist:
     def __init__(self):
         self.authority = {}    # client connection id -> (host, port) from the CONNECT
-        self.tunneled = set()  # hosts already logged as a tunnel this run
+        self.rules = load_rules(None)
+        self.log_mode = "blocked"
+        self.config_path = self.log_path = None
+        self.checked = None    # mtime of ssbx.toml at the last load attempt
+
+    def load(self, loader):
+        loader.add_option(name="ssbx_config", typespec=str, default="", help="path to ssbx.toml")
 
     def running(self):
-        print(f"ssbx proxy: {len(RULES.hosts())} hosts allowed", file=sys.stderr, flush=True)
+        if ctx.options.ssbx_config:
+            self.config_path = Path(ctx.options.ssbx_config)
+            self.log_path = self.config_path.parent / "proxy.log"
+            self.reload()
+            asyncio.get_running_loop().create_task(self.reload_loop())
+        print(f"ssbx proxy: {len(self.rules.hosts())} hosts allowed", file=sys.stderr, flush=True)
+
+    async def reload_loop(self):
+        while True:
+            await asyncio.sleep(3)
+            self.reload()
+
+    def reload(self):  # a broken or missing ssbx.toml keeps the last good rules
+        try:
+            mtime = self.config_path.stat().st_mtime
+        except OSError as e:
+            mtime, error = -1.0, str(e)
+        else:
+            error = None
+        if mtime == self.checked:
+            return
+        self.checked = mtime
+        if error is None:
+            try:
+                with open(self.config_path, "rb") as f:
+                    config = tomllib.load(f)
+                log_mode = config.get("log", "blocked")
+                if log_mode not in ("all", "blocked"):
+                    raise ConfigError('log must be "all" or "blocked"')
+                rules = load_rules(config.get("hosts"))
+            except (OSError, tomllib.TOMLDecodeError, ConfigError) as e:
+                error = str(e)
+            else:
+                self.rules, self.log_mode = rules, log_mode
+                self.log({"event": "reload", "hosts": len(rules.hosts())})
+                return
+        self.log({"event": "config_error", "error": error})
+
+    def log(self, event):  # one JSON line appended to proxy.log, rotated once past 20 MB
+        line = json.dumps({"ts": now(), **event}, ensure_ascii=False, separators=(",", ":"))
+        if not self.log_path:
+            print(line, flush=True)
+            return
+        try:
+            if self.log_path.exists() and self.log_path.stat().st_size > LOG_MAX_BYTES:
+                self.log_path.replace(self.log_path.with_name(self.log_path.name + ".1"))
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError as e:
+            print(f"ssbx proxy: cannot write {self.log_path}: {e}", file=sys.stderr, flush=True)
 
     async def http_connect(self, flow: http.HTTPFlow):  # a CONNECT: the sandbox wants a TLS tunnel to host:port
         host, port = normalize_host(flow.request.host), flow.request.port
-        if host == AUDIT_HOST:
-            return self.block(flow, "events are posted as plain HTTP")
         if port != 443:
             return self.block(flow, f"port {port} is not reachable, only 443 for HTTPS")
-        entry = RULES.find(host)
+        entry = self.rules.find(host)
         if entry is None:
-            return self.block(flow, Decision(False, f"{host} is not in your allowlist"))
+            return self.block(flow, self.rules.decide(host, "GET", "/"))
         reason = await resolve(host, port)
         if reason:
             return self.block(flow, reason)
@@ -516,26 +512,14 @@ class Allowlist:
         if not data.context.server.address:
             return
         host = normalize_host(data.context.server.address[0])
-        entry = RULES.find(host)
+        entry = self.rules.find(host)
         if entry is not None and entry.tunnel and normalize_host(data.client_hello.sni or "") == host:
             data.ignore_connection = True
-            if host not in self.tunneled:
-                self.tunneled.add(host)
-                log_event({"source": "proxy", "event": "tunnel", "host": host})
 
     def client_disconnected(self, client):
         self.authority.pop(client.id, None)
 
     async def requestheaders(self, flow: http.HTTPFlow):  # everything is decided here, before anything goes out
-        request = flow.request
-        if normalize_host(request.host) == AUDIT_HOST:
-            length = request.headers.get("Content-Length")
-            status = 405 if request.scheme != "http" or request.method != "POST" else 411 if length is None or not length.isdigit() else 413 if int(length) > AUDIT_MAX_BYTES else None
-            if status:
-                flow.response = http.Response.make(status)
-            else:
-                request.stream = False  # the body is read in request() below
-            return
         try:
             await self.check(flow)
         except Exception as e:  # noqa: BLE001 - an error never lets a request out
@@ -554,9 +538,9 @@ class Allowlist:
             return self.block(flow, "the request does not match the connection's destination")
         if plain and request.port != 80:
             return self.block(flow, f"port {request.port} is not reachable, only 80 for plain HTTP")
-        entry = RULES.find(host)
+        entry = self.rules.find(host)
         if entry is None:
-            return self.block(flow, RULES.decide(host, request.method, request.path))
+            return self.block(flow, self.rules.decide(host, request.method, request.path))
         if plain and entry.token is not None:
             return self.block(flow, "a host with a token is only reachable over HTTPS")
         reason = why_unusual_path(request.path)
@@ -572,7 +556,7 @@ class Allowlist:
         method, path = request.method, request.path
         git = git_request(method, path, request.headers.get("Content-Type", ""))
         if git is not None:
-            return self.settle(flow, entry, RULES.decide(host, method, git[1], git=git[0]), is_git=True)
+            return self.settle(flow, entry, self.rules.decide(host, method, git[1], git=git[0]), is_git=True)
         if is_graphql_path(path):
             if method != "POST":
                 return self.block(flow, "GraphQL is only allowed as POST")
@@ -582,13 +566,11 @@ class Allowlist:
             request.stream = False  # request() below reads the document and decides
             flow.metadata["ssbx_graphql"] = entry
             return
-        self.settle(flow, entry, RULES.decide(host, method, path))
+        self.settle(flow, entry, self.rules.decide(host, method, path))
 
     def request(self, flow: http.HTTPFlow):
         if flow.response is not None:
             return
-        if normalize_host(flow.request.host) == AUDIT_HOST:
-            return self.audit(flow)
         entry = flow.metadata.get("ssbx_graphql")
         if entry is None:
             return
@@ -598,7 +580,7 @@ class Allowlist:
         except ValueError as e:
             return self.block(flow, f"not a readable GraphQL request ({e})")
         host = normalize_host(flow.request.host)
-        self.settle(flow, entry, RULES.decide(host, flow.request.method, flow.request.path, graphql=operations))
+        self.settle(flow, entry, self.rules.decide(host, flow.request.method, flow.request.path, graphql=operations))
 
     def settle(self, flow, entry, decision, is_git=False):
         if not decision.allowed:
@@ -606,8 +588,8 @@ class Allowlist:
         request = flow.request
         if entry.token is not None:
             request.headers.update(auth_headers(entry.kind, entry.token, is_git))
-        if LOG_MODE != "blocked":
-            log_event({"source": "proxy", "event": "allowed", "method": request.method, "host": normalize_host(request.host), "path": normalize_path(request.path)})
+        if self.log_mode == "all":
+            self.log({"event": "allowed", "method": request.method, "host": normalize_host(request.host), "path": normalize_path(request.path)})
 
     def block(self, flow, why):  # answer 403 and log it; why is a reason string or a Decision
         request = flow.request
@@ -615,24 +597,11 @@ class Allowlist:
         suggestion = None if isinstance(why, str) else why.suggest
         flow.response = http.Response.make(403, f"Blocked by the ssbx proxy: {reason}\n" + (f"\nTo allow it, add to ssbx.toml:\n{suggestion}\n" if suggestion else ""), {"Content-Type": "text/plain"})
         path = "" if request.method == "CONNECT" else normalize_path(request.path)
-        event = {"source": "proxy", "event": "blocked", "method": request.method, "host": normalize_host(request.host), "path": path, "reason": reason}
+        host = normalize_host(request.host)
+        event = {"event": "blocked", "method": request.method, "host": host, "path": path, "reason": reason}
         if suggestion:
             event["suggest"] = suggestion
-        log_event(event)
-
-    def audit(self, flow):  # an event the sandbox reported about itself; logged, never forwarded
-        body = flow.request.get_content(strict=False) or b""
-        try:
-            event = json.loads(body)
-            if not isinstance(event, dict) or not isinstance(event.get("event"), str):
-                raise ValueError("not an event")
-        except ValueError:
-            flow.response = http.Response.make(400)
-            return
-        event.pop("ts", None)
-        event["source"] = "sandbox"  # self-reported, whatever the sandbox claims
-        log_event(event)
-        flow.response = http.Response.make(204)
-
+        self.log(event)
+        print(f"ssbx proxy: blocked {request.method} {host}{path}  ({reason})", file=sys.stderr, flush=True)
 
 addons = [Allowlist()]
