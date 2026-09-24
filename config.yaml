@@ -25,8 +25,7 @@ termlog_verbosity: warn
 # A corporate upstream proxy for all of ssbx's own traffic:
 #mode: upstream:http://proxy:3128
 
-# The allowlist. mitm.it: mitmproxy's own page that hands out its CA (never
-# leaves the proxy). api.anthropic.com: any method. deb.debian.org and
+# The allowlist. api.anthropic.com: any method. deb.debian.org and
 # security.debian.org: GET/HEAD (apt). registry.npmjs.org: GET (npm).
 # pypi.org and files.pythonhosted.org: GET (pip). github.com: GET/HEAD
 # plus the POST that git clone/fetch needs (git-upload-pack) - so
@@ -34,8 +33,7 @@ termlog_verbosity: warn
 block_list:
 - >-
   ;!(
-  ~d "^mitm\.it$"
-  | ~d "^api\.anthropic\.com$"
+  ~d "^api\.anthropic\.com$"
   | ( ~d "^(deb\.debian\.org|security\.debian\.org)$" & ~m "^(GET|HEAD)$" )
   | ( ~d "^registry\.npmjs\.org$" & ~m "^GET$" )
   | ( ~d "^(pypi\.org|files\.pythonhosted\.org)$" & ~m "^GET$" )
