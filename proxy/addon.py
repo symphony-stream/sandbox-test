@@ -1,72 +1,75 @@
 """
-The ssbx proxy. Everything that leaves the sandbox goes through here.
+The ssbx proxy. It runs on your machine; the VM can reach nothing else.
 
-Hosts from your hosts file (~/.config/ssbx/hosts) are read-only for the sandbox.
-Allowed:
-  - GET and HEAD requests
-  - git clone and git fetch
-  - Jira searches, which are POST requests that only read
-Blocked:
-  - git push
-  - every other POST, PUT, PATCH and DELETE: no merge requests, no comments,
-    no pipelines, no CI triggers, no issue changes
-  - WebSockets, plain HTTP, and the endpoints that hand out other credentials
-The proxy adds your token to the requests it lets through. The sandbox itself
-never has the token.
+Everything the sandbox sends comes through here and is checked against the
+allowlist in ssbx.toml (see rules.py for the format). Hosts that are not in
+the list are refused. For hosts with a token the proxy adds the token to the
+requests it lets through, so the token never enters the VM.
 
-All other hosts on the internet (Anthropic, npm, PyPI and so on) are passed
-through untouched, encrypted end to end, on ports 80 and 443 only. Your
-machine, the VM and your local network are out of reach. If an upstream proxy
-is configured, everything goes through it.
+Three kinds of hosts:
+  - tunnel:    `allow = "*"` and no token. The TLS connection is passed
+               through as it is; the proxy sees only the host and port.
+  - intercept: every other listed host. The proxy ends the TLS connection
+               with its own certificate (the VM trusts it), looks at each
+               request's method and path, and refuses what no entry allows.
+  - token:     intercepted, plus the token is added.
 
-Every decision is made when the request headers arrive, before anything is
-forwarded. Everything the proxy sees is written to the audit log, one JSON
-object per line (SSBX_LOG_FILE), and to stdout for `docker logs`. Claude Code
-inside the sandbox reports its own events (tool calls, refusals) to the same
-log by posting them to http://ssbx.audit/, a name that exists only here. Those
-events carry "source": "sandbox"; the proxy's own carry "source": "proxy".
+Every decision is made when the request headers arrive, before a byte goes
+out; only GraphQL documents are read first, to tell queries from mutations.
+Decisions land in the audit log (SSBX_LOG_FILE), one JSON object per line.
+Claude Code inside the VM reports its own events (tool calls, refusals) to
+the same log by posting them to http://ssbx.audit/, a name that exists only
+here. Those events carry "source": "sandbox"; the proxy's carry "source": "proxy".
+
+Started by the ssbx launcher: mitmdump -s addon.py, with SSBX_CONFIG pointing
+at ssbx.toml.
 """
 
 import asyncio
-import base64
-import ipaddress
 import json
 import os
 import re
 import socket
 import sys
 import time
-import urllib.parse
+import tomllib
 from datetime import datetime, timezone
 
 from mitmproxy import ctx, http, tls
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import rules  # noqa: E402
 
+CONFIG_FILE = os.environ.get("SSBX_CONFIG", "")
 LOG_FILE = os.environ.get("SSBX_LOG_FILE", "")
 LOG_MAX_BYTES = 20 * 1024 * 1024  # then the log is rotated once, to <name>.1
 
-# The name the sandbox posts its events to. Never forwarded anywhere.
-AUDIT_HOST = "ssbx.audit"
+AUDIT_HOST = "ssbx.audit"  # where the sandbox posts its events; never forwarded
 AUDIT_MAX_BYTES = 16 * 1024
 AUDIT_MAX_PER_SECOND = 20
 AUDIT_BUDGET_BYTES = 4 * 1024 * 1024  # per AUDIT_BUDGET_SECONDS, so a flood cannot push the proxy's own records out
 AUDIT_BUDGET_SECONDS = 600
 
+GRAPHQL_MAX_BYTES = 1024 * 1024
+REPEAT_WINDOW = 60      # identical refusals within this many seconds become one event
+SUMMARY_EVERY = 300     # GETs on intercepted hosts and tunnels are summarised this often
 
-# Read the hosts file. The launcher passes its content in SSBX_HOSTS.
-# Each line is: host  kind  token
+VALID_METHODS = set(rules.METHODS) | {"HEAD"}
 
-TOKENS = {}
 
-for line in os.environ.get("SSBX_HOSTS", "").splitlines():
-    line = line.strip()
-    if line == "" or line.startswith("#"):
-        continue
-    parts = line.split(None, 2)
-    if len(parts) != 3:
-        sys.exit(f"ssbx proxy: bad line in the hosts file, expected 'host kind token': {line!r}")
-    host, kind, token = parts
-    TOKENS[host.lower()] = (kind, token.strip())
+def read_config():
+    try:
+        with open(CONFIG_FILE, "rb") as f:
+            config = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        sys.exit(f"ssbx proxy: cannot read {CONFIG_FILE}: {e}")
+    try:
+        return rules.load(config.get("hosts"))
+    except rules.ConfigError as e:
+        sys.exit(f"ssbx proxy: {CONFIG_FILE}: {e}")
+
+
+RULES = read_config()
 
 
 # ------------------------------------------------------------------ the log
@@ -76,19 +79,20 @@ def now():
 
 
 def log_event(event):
-    """Append one event to the audit log and print it for `docker logs`."""
+    """Append one event to the audit log."""
     event = {"ts": now(), **event}
     line = json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "replace") + b"\n"
-    if LOG_FILE:
-        try:
-            if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
-                os.replace(LOG_FILE, LOG_FILE + ".1")
-            with open(LOG_FILE, "ab") as f:
-                f.write(line)
-        except Exception as e:  # noqa: BLE001
-            print(f"ssbx proxy: cannot write {LOG_FILE}: {e}", file=sys.stderr, flush=True)
-    sys.stdout.buffer.write(line)
-    sys.stdout.flush()
+    if not LOG_FILE:
+        sys.stdout.buffer.write(line)
+        sys.stdout.flush()
+        return
+    try:
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
+            os.replace(LOG_FILE, LOG_FILE + ".1")
+        with open(LOG_FILE, "ab") as f:
+            f.write(line)
+    except Exception as e:  # noqa: BLE001
+        print(f"ssbx proxy: cannot write {LOG_FILE}: {e}", file=sys.stderr, flush=True)
 
 
 # Query strings can carry tokens (?private_token=...). Their values are not logged.
@@ -102,235 +106,119 @@ def logged_path(path):
     return path + "?" + SECRET_PARAM.sub(r"\1***", query)
 
 
-# Connections to hosts that are not in the hosts file are logged once per host
-# and port every few minutes, not once per connection.
-PASSTHROUGH_SEEN = {}
-PASSTHROUGH_EVERY = 300
+# ------------------------------------------------------------------ addresses
+
+def upstream_mode():
+    return bool(ctx.options.mode) and any(str(m).startswith("upstream:") for m in ctx.options.mode)
 
 
-def note_passthrough(host, port, **extra):
-    key = (host, port)
-    now_s = time.monotonic()
-    if extra or now_s - PASSTHROUGH_SEEN.get(key, -PASSTHROUGH_EVERY) >= PASSTHROUGH_EVERY:
-        PASSTHROUGH_SEEN[key] = now_s
-        log_event({"source": "proxy", "event": "passthrough", "host": host, "port": port, **extra})
-
-
-# ------------------------------------------------------------------ tokens
-
-def basic_auth(user, password):
-    pair = f"{user}:{password}".encode()
-    return "Basic " + base64.b64encode(pair).decode()
-
-
-def auth_headers(kind, token, is_git):
-    """The header that carries the token, in the form each service expects."""
-    if kind == "gitlab":
-        if is_git:
-            return {"Authorization": basic_auth("oauth2", token)}
-        return {"PRIVATE-TOKEN": token}
-
-    if kind == "github":
-        if is_git:
-            return {"Authorization": basic_auth("x-access-token", token)}
-        return {"Authorization": f"Bearer {token}"}
-
-    if kind == "atlassian":
-        # token is "you@example.com:api-token"
-        email, api_token = token.split(":", 1)
-        return {"Authorization": basic_auth(email, api_token)}
-
-    if kind == "bearer":
-        return {"Authorization": f"Bearer {token}"}
-
-    raise ValueError(f"unknown kind in hosts file: {kind}")
-
-
-for _host, (_kind, _token) in TOKENS.items():
-    auth_headers(_kind, _token, False)  # fail at startup on a bad kind, not on first use
-
-
-# ------------------------------------------------------------------ the rules
-
-# Only plain paths are accepted, so a write cannot hide behind something like
-# /rest/api/3/issue;/search or a doubled slash.
-PLAIN_PATH = re.compile(r"^/$|^(/[A-Za-z0-9._~%+@:,-]+)+/?$")
-
-# git clone and git fetch: /group/repo.git/info/refs and /group/repo.git/git-upload-pack.
-# Never under /api/, where GitLab could take the last part for a file name.
-GIT_READ = re.compile(r"^(?!/api/)(/[A-Za-z0-9._~-]+)+/(info/refs|git-upload-pack)$")
-
-# Jira searches are POST requests that only read. Exact paths, with an
-# optional context path in front for Data Center (/jira/rest/api/2/search).
-JIRA_SEARCH = re.compile(r"^(/[A-Za-z0-9._~-]+)?/rest/api/(2|3|latest)/(search(/jql|/approximate-count)?|issue/bulkfetch)$")
-
-GRAPHQL_MUTATION = re.compile(r"\bmutation\b")
-
-
-def graphql_reads_only(body):
-    """True if the body is a GraphQL request (one or a batch) with queries only.
-    The JSON is decoded first, so \\u006dutation does not slip through."""
-    try:
-        document = json.loads(body)
-    except ValueError:
-        return False
-    operations = document if isinstance(document, list) else [document]
-    if not operations:
-        return False
-    for operation in operations:
-        if not isinstance(operation, dict) or not isinstance(operation.get("query"), str):
-            return False
-        if GRAPHQL_MUTATION.search(operation["query"]):
-            return False
-    return True
-
-# Endpoints that turn the token into other credentials.
-CREDENTIAL_PATHS = ("/jwt/", "/oauth/", "/-/", "/login", "/session", "/users/sign_in")
-
-
-def why_blocked(request, kind):
-    """Return the reason to block a request to a host with a token, or None."""
-    path = request.path.split("?", 1)[0]
-    method = request.method
-
-    if request.scheme != "https" or request.port != 443:
-        return "the token only travels over HTTPS on port 443"
-
-    if "upgrade" in request.headers.get("Connection", "").lower() or "Upgrade" in request.headers:
-        return "WebSockets are not allowed"
-
-    # The server decodes %XX before it looks at the path, so the checks look
-    # at both spellings.
-    decoded = urllib.parse.unquote(path)
-    if not PLAIN_PATH.match(path) or "\\" in decoded or any(ord(c) < 32 for c in decoded):
-        return "unusual path"
-    for p in (path, decoded):
-        if "/../" in p + "/" or "/./" in p + "/":
-            return "unusual path"
-        if p.startswith(CREDENTIAL_PATHS) or "/jwt/" in p or "/oauth/" in p:
-            return "that endpoint hands out credentials"
-
-    if "git-receive-pack" in request.path:
-        return "git push is not allowed"
-
-    if decoded == "/graphql" and method != "POST":
-        return "GraphQL only over POST"
-
-    if method in ("GET", "HEAD"):
-        return None
-
-    if method == "POST":
-        if GIT_READ.match(path) and path.endswith("/git-upload-pack"):
-            return None  # git clone / git fetch
-        if kind in ("atlassian", "bearer") and JIRA_SEARCH.match(path):
-            return None  # Jira search
-        if kind == "github" and path == "/graphql":
-            return None  # GitHub GraphQL: the body is checked for mutations in request()
-
-    return f"{method} {path} would change something, only reading is allowed"
-
-
-# The sandbox may only talk to the internet: not to your machine, the VM or
-# the local network, whatever name it uses for them.
-PRIVATE_NAMES = {"localhost", "host.docker.internal", "host.lima.internal", "proxy", "ssbx-proxy"}
-PRIVATE_SUFFIXES = (".localhost", ".internal", ".local", ".lan", ".home", ".arpa")
-
-
-def is_private_name(host):
-    host = host.lower().rstrip(".").strip("[]")
-    if host in PRIVATE_NAMES or host.endswith(PRIVATE_SUFFIXES) or "." not in host:
-        return True
-    try:
-        return not ipaddress.ip_address(host).is_global
-    except ValueError:
-        pass
-    try:  # 127.1, 0177.0.0.1, 0x7f000001: the old spellings of an IPv4 address
-        return not ipaddress.ip_address(socket.inet_ntoa(socket.inet_aton(host))).is_global
-    except OSError:
-        return False
-
-
-async def resolves_private(host, port):
-    """"private" if the name resolves to anything that is not a public address,
-    "unresolved" if it cannot be resolved at all, None if it is fine.
-    With an upstream proxy the upstream resolves names, so only literal
-    addresses can be checked."""
-    if ctx.options.mode and any(m.startswith("upstream:") for m in ctx.options.mode):
-        return None
+async def resolve(host, port):
+    """(address, None) for the address the proxy will connect to, or
+    (None, reason). IPv4 first. With an upstream proxy the upstream resolves
+    names, so nothing is checked here."""
+    if upstream_mode():
+        return None, None
     loop = asyncio.get_running_loop()
-    try:
-        infos = await loop.getaddrinfo(host, port)
-    except OSError:
-        await asyncio.sleep(0.5)  # the resolver may still be waking up
+    infos = None
+    for attempt in (1, 2):
         try:
-            infos = await loop.getaddrinfo(host, port)
+            infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+            break
         except OSError:
-            return "unresolved"
-    for info in infos:
-        try:
-            if not ipaddress.ip_address(info[4][0]).is_global:
-                return "private"
-        except ValueError:
-            return "private"
-    return None
-
-
-async def why_unreachable(host, port, tunnel=False):
-    """Return the reason a host outside the hosts file is out of reach, or None.
-    A CONNECT tunnel is only for TLS on 443: plain HTTP goes as plain HTTP, so
-    that the proxy sees it (and the upstream proxy's login never ends up in it)."""
-    if is_private_name(host):
-        return "private addresses are not reachable from the sandbox"
-    if port not in ((443,) if tunnel else (80, 443)):
-        return f"port {port} is not reachable from the sandbox" + (", only 443 for a tunnel" if tunnel else ", only 80 and 443")
-    resolved = await resolves_private(host, port)
-    if resolved == "unresolved":
-        return "that name could not be resolved"
-    if resolved == "private":
-        return "that name points to a private address"
-    return None
+            if attempt == 1:
+                await asyncio.sleep(0.5)  # the resolver may still be waking up
+    if not infos:
+        return None, f"{host} could not be resolved"
+    addresses = [info[4][0] for info in infos]
+    bad = [a for a in addresses if not rules.address_is_reachable(a)]
+    if bad:
+        return None, f"{host} points at {bad[0]}, which is not reachable from the sandbox"
+    addresses.sort(key=lambda a: ":" in a)  # IPv4 first
+    return addresses[0], None
 
 
 # ------------------------------------------------------------------ the proxy
 
-class ReadOnly:
+class Allowlist:
     def __init__(self):
+        self.pinned = {}          # client connection id -> {(host, port): address}
+        self.recent_blocks = {}   # (method, host, path, reason) -> [last logged, suppressed]
+        self.get_counts = {}      # host -> [count, first seen]
+        self.tunnel_counts = {}   # (host, port) -> [count, first seen]
         self.audit_window = 0
         self.audit_count = 0
         self.audit_dropped = 0
         self.audit_budget_window = 0
         self.audit_budget_used = 0
 
+    def running(self):
+        if ctx.options.connection_strategy != "lazy":
+            print("ssbx proxy: connection_strategy should be lazy", file=sys.stderr, flush=True)
+        modes = {"tunnel": [], "intercept": [], "token": []}
+        for host in RULES.hosts():
+            modes[host.mode].append(host.name)
+        warnings = RULES.warnings()
+        if upstream_mode():
+            warnings.append("an upstream proxy resolves names, so addresses are not checked here")
+        for w in warnings:
+            print(f"ssbx proxy: {w}", file=sys.stderr, flush=True)
+        log_event({"source": "proxy", "event": "rules", **modes, "warnings": warnings})
+        print(f"ssbx proxy: {len(modes['tunnel'])} tunnel, {len(modes['intercept'])} intercepted, "
+              f"{len(modes['token'])} with token", file=sys.stderr, flush=True)
+
+    def done(self):
+        self.flush_summaries(force=True)
+
+    # -- connections ------------------------------------------------------
+
     async def http_connect(self, flow: http.HTTPFlow):
-        # A CONNECT from the sandbox: an HTTPS (or other TLS) tunnel is asked for.
-        host, port = flow.request.host.lower(), flow.request.port
-        if host in TOKENS:
-            if port != 443:
-                self.block(flow, "the token only travels over HTTPS on port 443")
-            return
+        """A CONNECT from the sandbox: it wants a TLS tunnel to host:port."""
+        host, port = rules.normalize_host(flow.request.host), flow.request.port
         if host == AUDIT_HOST:
             self.block(flow, "events are posted as plain HTTP")
             return
-        reason = await why_unreachable(host, port, tunnel=True)
+        if port != 443:
+            self.block(flow, f"port {port} is not reachable, only 443 for HTTPS")
+            return
+        entry = RULES.find(host)
+        if entry is None:
+            return  # the tunnel is opened with our certificate, so the first request is logged with its path
+        address, reason = await resolve(host, port)
         if reason:
             self.block(flow, reason)
+            return
+        if address:
+            self.pinned.setdefault(flow.client_conn.id, {})[(host, port)] = address
 
     def tls_clienthello(self, data: tls.ClientHelloData):
-        # Only open up connections to hosts from the hosts file. Everything else
-        # stays encrypted end to end. We look at the host the sandbox asked to
-        # connect to, not at the name it puts in the TLS handshake.
-        host, port = data.context.server.address[0].lower(), data.context.server.address[1]
-        if host not in TOKENS:
-            data.ignore_connection = True
-            note_passthrough(host, port)
+        if not data.context.server.address:
+            return
+        host, port = data.context.server.address
+        host = rules.normalize_host(host)
+        entry = RULES.find(host)
+        if entry is not None and entry.tunnel:
+            data.ignore_connection = True  # end to end encrypted, we only see host and port
+            self.count(self.tunnel_counts, (host, port), "passthrough", host=host, port=port)
+
+    def server_connect(self, data):
+        """Connect to the address that was checked, not to a second lookup."""
+        host, port = data.server.address
+        address = self.pinned.get(data.client.id, {}).get((rules.normalize_host(host), port))
+        if address:
+            data.server.address = (address, port)
+
+    def client_disconnected(self, client):
+        self.pinned.pop(client.id, None)
+
+    # -- requests ---------------------------------------------------------
 
     async def requestheaders(self, flow: http.HTTPFlow):
-        # Everything is decided here, before a byte of the request goes out.
+        """Everything is decided here, before the request goes anywhere."""
         request = flow.request
-        host = request.host.lower()
+        host = rules.normalize_host(request.host)
 
         if host == AUDIT_HOST:
-            if request.method != "POST":
+            if request.scheme != "http" or request.method != "POST":
                 flow.response = http.Response.make(405)
             elif int(request.headers.get("Content-Length", "0") or 0) > AUDIT_MAX_BYTES:
                 flow.response = http.Response.make(413)
@@ -338,81 +226,181 @@ class ReadOnly:
                 request.stream = False  # the body is read in request() below
             return
 
-        if host not in TOKENS:
-            # Plain HTTP to some other host. Passed through as it is.
-            reason = await why_unreachable(host, request.port)
-            if reason:
-                self.block(flow, reason)
-            else:
-                note_passthrough(host, request.port, method=request.method, path=logged_path(request.path))
-            return
-
-        # A host with a token. Never let an error in here turn into a request
-        # going out with, or without, the token.
         try:
-            self.with_token(flow)
+            await self.check(flow, host)
         except Exception as e:  # noqa: BLE001
-            self.block(flow, f"proxy error: {e}")
+            self.block(flow, f"proxy error: {e}")  # an error never lets a request out
 
-    def with_token(self, flow):
+    async def check(self, flow, host):
         request = flow.request
-        host = request.host.lower()
-        kind, token = TOKENS[host]
+        entry = RULES.find(host)
+        plain = request.scheme == "http"
 
-        # The Host header must name the same host we connected to, otherwise the
-        # token could end up at another server.
-        header_host = request.host_header.split(":")[0].lower() if request.host_header else host
-        if header_host != host:
-            self.block(flow, "Host header does not match the connection")
+        if plain and request.port != 80:
+            self.block(flow, f"port {request.port} is not reachable, only 80 for plain HTTP")
+            return
+        if entry is None:
+            self.block(flow, RULES.decide(host, request.method, request.path))
+            return
+        if plain and entry.token is not None:
+            self.block(flow, "a host with a token is only reachable over HTTPS")
             return
 
-        reason = why_blocked(request, kind)
+        # The request has to be about the host the connection was opened to.
+        header_host = request.host_header or host
+        if header_host.startswith("["):
+            header_host = header_host[1:].split("]", 1)[0]
+        elif header_host.count(":") == 1:
+            header_host = header_host.rsplit(":", 1)[0]
+        if rules.normalize_host(header_host) != host:
+            self.block(flow, "the Host header names another host")
+            return
+
+        method = request.method
+        if method not in VALID_METHODS:
+            self.block(flow, f"unusual method {method!r}")
+            return
+        if "upgrade" in request.headers.get("Connection", "").lower() or "Upgrade" in request.headers:
+            self.block(flow, "WebSockets and other upgrades are not allowed")
+            return
+        if "X-HTTP-Method-Override" in request.headers or "X-Method-Override" in request.headers \
+                or "_method=" in request.path.split("?", 1)[-1]:
+            self.block(flow, "a method override is not allowed")
+            return
+        length = request.headers.get("Content-Length")
+        if length is not None and not length.strip().isdigit():
+            self.block(flow, "bad Content-Length")
+            return
+
+        path = request.path
+        reason = rules.why_unusual_path(path)
         if reason:
             self.block(flow, reason)
             return
+        if entry.token is not None and rules.hands_out_credentials(path):
+            self.block(flow, "that endpoint hands out credentials")
+            return
 
-        # Drop whatever credentials the sandbox sent and add ours.
-        for name in ("Authorization", "PRIVATE-TOKEN", "Cookie", "Proxy-Authorization"):
-            request.headers.pop(name, None)
+        if plain:  # the address is checked here, a CONNECT never happened
+            address, reason = await resolve(host, 80)
+            if reason:
+                self.block(flow, reason)
+                return
+            if address:
+                self.pinned.setdefault(flow.client_conn.id, {})[(host, 80)] = address
 
-        if request.path.split("?", 1)[0] == "/graphql":
-            request.stream = False  # request() below looks at the body first
-            flow.metadata["ssbx_graphql"] = True
+        # Whatever credentials the sandbox sent, they do not go to a host with a token.
+        if entry.token is not None:
+            for name in ("Authorization", "PRIVATE-TOKEN", "Cookie", "Proxy-Authorization"):
+                request.headers.pop(name, None)
 
-        is_git = GIT_READ.match(request.path.split("?", 1)[0]) is not None
-        request.headers.update(auth_headers(kind, token, is_git))
+        git = rules.git_request(method, path, request.headers.get("Content-Type", ""))
+        if git is not None:
+            decision = RULES.decide(host, method, git[1], git=git[0])
+            self.settle(flow, entry, decision, is_git=True)
+            return
 
-        if not flow.metadata.get("ssbx_graphql"):
-            self.allowed(flow)
+        if rules.is_graphql_path(path):
+            if method != "POST":
+                self.block(flow, "GraphQL is only allowed as POST")
+                return
+            length = request.headers.get("Content-Length", "")
+            if not length.isdigit() or int(length) > GRAPHQL_MAX_BYTES:
+                self.block(flow, "a GraphQL request needs a Content-Length of at most 1 MB")
+                return
+            request.stream = False  # request() reads the document and decides
+            flow.metadata["ssbx_graphql"] = entry
+            return
 
-    def allowed(self, flow):
-        request = flow.request
-        log_event({"source": "proxy", "event": "allowed", "method": request.method,
-                   "host": request.host.lower(), "path": logged_path(request.path)})
+        self.settle(flow, entry, RULES.decide(host, method, path))
 
     def request(self, flow: http.HTTPFlow):
         if flow.response is not None:
             return
-        if flow.request.host.lower() == AUDIT_HOST:
+        host = rules.normalize_host(flow.request.host)
+        if host == AUDIT_HOST:
             self.audit(flow)
-        elif flow.metadata.get("ssbx_graphql"):
-            # A GraphQL document that writes has to say "mutation".
-            body = flow.request.get_text(strict=False) or ""
-            if not graphql_reads_only(body):
-                flow.request.headers.pop("Authorization", None)
-                self.block(flow, "a GraphQL mutation would change something, only reading is allowed")
-            else:
-                self.allowed(flow)
+            return
+        entry = flow.metadata.get("ssbx_graphql")
+        if entry is None:
+            return
+        try:
+            body = flow.request.get_content(strict=False) or b""
+            operations = rules.graphql_operations(body, GRAPHQL_MAX_BYTES)
+        except ValueError as e:
+            self.block(flow, f"not a readable GraphQL request ({e})")
+            return
+        except Exception as e:  # noqa: BLE001
+            self.block(flow, f"proxy error: {e}")
+            return
+        self.settle(flow, entry, RULES.decide(host, flow.request.method, flow.request.path, graphql=operations))
 
-    def block(self, flow, reason):
+    def settle(self, flow, entry, decision, is_git=False):
+        if not decision.allowed:
+            self.block(flow, decision)
+            return
         request = flow.request
+        if entry.token is not None:
+            request.headers.update(rules.auth_headers(entry.kind, entry.token, is_git))
+        host = rules.normalize_host(request.host)
+        if entry.token is None and request.method in ("GET", "HEAD"):
+            self.count(self.get_counts, host, "allowed", host=host, method="GET")
+            return
+        log_event({"source": "proxy", "event": "allowed", "method": request.method, "host": host,
+                   "path": logged_path(request.path), "rule": decision.rule})
+
+    def block(self, flow, why):
+        """Answer 403 and log it. why is a reason string or a Decision."""
+        request = flow.request
+        reason = why if isinstance(why, str) else why.reason
+        suggest = None if isinstance(why, str) else why.suggest
         flow.response = http.Response.make(
-            403,
-            f"Blocked by the ssbx proxy: {reason}\n",
-            {"Content-Type": "text/plain"},
-        )
-        log_event({"source": "proxy", "event": "blocked", "method": request.method,
-                   "host": request.host.lower(), "path": logged_path(request.path), "reason": reason})
+            403, f"Blocked by the ssbx proxy: {reason}\n" + (f"\nTo allow it, add to ssbx.toml:\n{suggest}\n" if suggest else ""),
+            {"Content-Type": "text/plain"})
+        method = request.method
+        path = "" if method == "CONNECT" else logged_path(request.path)
+        key = (method, rules.normalize_host(request.host), path, reason)
+        clock = time.monotonic()
+        recent = self.recent_blocks.get(key)
+        if recent and clock - recent[0] < REPEAT_WINDOW:
+            recent[1] += 1
+            return
+        event = {"source": "proxy", "event": "blocked", "method": method, "host": key[1], "path": path, "reason": reason}
+        if request.method == "CONNECT":
+            event["port"] = request.port
+        if suggest:
+            event["suggest"] = suggest
+        if recent and recent[1]:
+            event["repeated"] = recent[1]
+        log_event(event)
+        self.recent_blocks[key] = [clock, 0]
+        if len(self.recent_blocks) > 1000:
+            self.recent_blocks = {k: v for k, v in self.recent_blocks.items() if clock - v[0] < REPEAT_WINDOW}
+
+    # -- summaries --------------------------------------------------------
+
+    def count(self, table, key, event, **fields):
+        """Log the first occurrence at once, then one summary per SUMMARY_EVERY."""
+        clock = time.monotonic()
+        entry = table.get(key)
+        if entry is None:
+            log_event({"source": "proxy", "event": event, **fields})
+            table[key] = [0, clock, fields]
+            return
+        entry[0] += 1
+        if clock - entry[1] >= SUMMARY_EVERY:
+            log_event({"source": "proxy", "event": event, **entry[2], "count": entry[0]})
+            table[key] = [0, clock, fields]
+
+    def flush_summaries(self, force=False):
+        for table in (self.get_counts, self.tunnel_counts):
+            for key, entry in list(table.items()):
+                if entry[0] and (force or time.monotonic() - entry[1] >= SUMMARY_EVERY):
+                    log_event({"source": "proxy", "event": "allowed" if table is self.get_counts else "passthrough",
+                               **entry[2], "count": entry[0]})
+                    del table[key]
+
+    # -- the sandbox's own events -----------------------------------------
 
     def audit(self, flow):
         """An event reported by the sandbox itself. Logged, never forwarded.
@@ -452,4 +440,4 @@ class ReadOnly:
         flow.response = http.Response.make(204)
 
 
-addons = [ReadOnly()]
+addons = [Allowlist()]

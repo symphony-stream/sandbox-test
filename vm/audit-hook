@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Claude Code hook inside the sandbox. Reports what the agent does to the
-ssbx audit log.
+Claude Code hook inside the VM. Reports what the agent does to the ssbx
+audit log on your machine.
 
 Claude Code runs this for the events wired up in managed-settings.json and
 gives it the event as JSON on stdin. We turn it into one small audit event and
-post it to http://ssbx.audit/ through the proxy, which appends it to the log
-on your machine. Nothing here can change what Claude does: we never answer,
+post it to http://ssbx.audit/ through the proxy, which appends it to the log. Nothing here can change what Claude does: we never answer,
 and we exit 0 whatever happens, so a broken log never blocks the agent.
 
 Events:
@@ -20,8 +19,11 @@ import json
 import os
 import re
 import sys
+import urllib.parse
 
-PROXY_HOST, PROXY_PORT = "proxy", 8080
+# The proxy on your machine, as the sandbox's environment names it.
+_proxy = urllib.parse.urlsplit(os.environ.get("HTTP_PROXY") or "http://host.lima.internal:17080")
+PROXY_HOST, PROXY_PORT = _proxy.hostname or "host.lima.internal", _proxy.port or 17080
 EVERYTHING = os.environ.get("SSBX_LOG", "all") != "blocked"
 MAX_TEXT = 500
 

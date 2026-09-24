@@ -1,0 +1,120 @@
+# ssbx configuration. ssbx copies this file to ~/.lima/_config/ssbx.toml on
+# the first run; edit it there. It holds your tokens, so keep it at mode 600.
+# After changing the [hosts] tables run `ssbx reload`. Changing cpus, memory,
+# disk or mounts takes effect after `ssbx stop`.
+
+# The folders of your machine the VM can see, read-write. The project you
+# start ssbx in has to be inside one of them. ~/.claude is always shared, so
+# Claude inside is Claude outside: same login, settings, sessions and history.
+mounts = ["~/Work"]
+
+cpus = 4
+memory = 8         # GiB
+disk = 60          # GiB
+
+# How Claude Code inside handles permissions: "bypassPermissions", "auto",
+# "acceptEdits" or "default". Empty: the same as on your machine.
+permission_mode = "bypassPermissions"
+
+# Extra environment variables for the sandbox.
+#env = { ANTHROPIC_MODEL = "claude-opus-5-5" }
+
+# Extra Debian packages for the VM, installed at the next start.
+#packages = ["build-essential", "golang"]
+
+# An upstream proxy for everything the sandbox sends out, if your network
+# needs one: "http://host:port" or "http://user:pass@host:port".
+#proxy = "http://proxy.example.com:3128"
+
+# The audit log: what the agent did and what was refused, one JSON object per
+# line. "all" logs every tool call and prompt, "blocked" only refusals and
+# failures (the proxy's refusals are always logged). See `ssbx logs`.
+log = "all"
+#log_file = "~/.lima/_config/ssbx/audit.jsonl"
+
+# The port the proxy listens on, on your machine only.
+#proxy_port = 17080
+
+
+# ---------------------------------------------------------------- hosts
+#
+# Where the sandbox may go. Everything else is refused; refusals show up in
+# `ssbx logs blocked` with a snippet you can paste here.
+#
+#   [hosts."name"]                  an exact host, or "*.name" for its subdomains
+#   allow = "METHODS [PATH]"        one entry, or a list of them
+#   kind = "github"                 optional: the proxy adds this token for you
+#   token = "..."                   kinds: github, gitlab, atlassian (email:api-token), bearer
+#   mutations = ["addComment"]      optional: GraphQL mutations allowed by name
+#
+# METHODS, separated by commas: GET (with HEAD), POST, PUT, PATCH, DELETE,
+# OPTIONS, git-fetch (clone, fetch, pull), git-push, graphql (queries only),
+# or * for everything. PATH: * is one path segment, ** any number of them; no
+# PATH means every path; for git-fetch and git-push it is the repository.
+# Entries only allow, in any order: a request passes if one of them fits.
+#
+# A host with only `allow = "*"` and no token is a plain tunnel: the proxy
+# sees the host and port and nothing else. Every other host is intercepted
+# with the proxy's certificate, so it can look at the method and path.
+
+# Claude Code itself
+[hosts."api.anthropic.com"]
+allow = "*"
+
+[hosts."statsig.anthropic.com"]
+allow = "*"
+
+[hosts."claude.ai"]
+allow = "*"
+
+[hosts."platform.claude.com"]
+allow = "*"
+
+# Claude Code's error and usage reports. Off unless you want them.
+#[hosts."http-intake.logs.us5.datadoghq.com"]
+#allow = "POST /api/v2/logs"
+
+# Packages: download only
+[hosts."registry.npmjs.org"]
+allow = "GET"
+
+[hosts."pypi.org"]
+allow = "GET"
+
+[hosts."files.pythonhosted.org"]
+allow = "GET"
+
+[hosts."deb.debian.org"]
+allow = "GET"
+
+[hosts."security.debian.org"]
+allow = "GET"
+
+# GitHub: read and clone everything, push to one repository, comment on
+# issues and pull requests. Give it a fine-grained token with only the
+# permissions you mean to use.
+#[hosts."github.com"]
+#kind = "github"
+#token = "github_pat_xxxxxxxxxxxxxxxx"
+#allow = ["GET,git-fetch", "git-push /me/scratch"]
+#
+#[hosts."*.githubusercontent.com"]
+#allow = "GET"
+#
+#[hosts."api.github.com"]
+#kind = "github"
+#token = "github_pat_xxxxxxxxxxxxxxxx"
+#allow = ["GET,graphql", "POST /repos/*/*/issues/*/comments"]
+#mutations = ["addComment"]
+
+# GitLab: read and clone, comment on merge requests
+#[hosts."gitlab.example.com"]
+#kind = "gitlab"
+#token = "glpat-xxxxxxxxxxxxxxxxxxxx"
+#allow = ["GET,git-fetch", "graphql /api/graphql", "POST /api/v4/projects/*/merge_requests/*/notes"]
+
+# Confluence and Jira Cloud: read everything, write comments, search
+#[hosts."example.atlassian.net"]
+#kind = "atlassian"
+#token = "you@example.com:ATATT3xxxxxxxxxxxx"
+#allow = ["GET", "POST /wiki/api/v2/footer-comments", "POST /rest/api/3/search/jql"]

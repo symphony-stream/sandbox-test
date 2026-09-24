@@ -81,13 +81,13 @@
   "skipDangerousModePermissionPrompt": true,
   "skipAutoPermissionPrompt": true,
   "env": {
-    "HTTP_PROXY": "http://proxy:8080",
-    "HTTPS_PROXY": "http://proxy:8080",
-    "http_proxy": "http://proxy:8080",
-    "https_proxy": "http://proxy:8080",
+    "HTTP_PROXY": "{{proxy}}",
+    "HTTPS_PROXY": "{{proxy}}",
+    "http_proxy": "{{proxy}}",
+    "https_proxy": "{{proxy}}",
     "NO_PROXY": "localhost,127.0.0.1",
     "no_proxy": "localhost,127.0.0.1",
-    "NODE_EXTRA_CA_CERTS": "/usr/local/share/ca-certificates/ssbx-proxy.crt",
+    "NODE_EXTRA_CA_CERTS": "/usr/local/share/ca-certificates/ssbx-ca.crt",
     "SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt",
     "REQUESTS_CA_BUNDLE": "/etc/ssl/certs/ca-certificates.crt",
     "DISABLE_AUTOUPDATER": "1"

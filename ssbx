@@ -1,574 +1,666 @@
-#!/usr/bin/env bash
-#
-# ssbx: open a sandbox shell in the current project.
-#
-# Usage:
-#   ssbx                 bash inside the sandbox, in this directory
-#   ssbx claude          run one command inside instead (ssbx -- cmd if cmd is a word below)
-#   ssbx logs            the audit log, live: what the agent did, what was refused
-#   ssbx logs blocked    only the refusals and failures
-#   ssbx status          is the VM running, are the images built, where is everything
-#   ssbx reload          stop the proxy; it starts again with the current settings on your next ssbx
-#   ssbx rebuild         rebuild the images from scratch (this also updates Claude Code)
-#   ssbx stop            stop the VM (needed after changing mounts, cpus, memory, disk)
-#
-# How it works: a Colima VM runs two containers. The sandbox container gets the
-# project you started it in and your ~/.claude, nothing else. Its only way out
-# is the proxy container, which keeps your tokens, lets only read requests
-# through to GitLab, Jira and the other hosts in your hosts file, and writes
-# the audit log. Settings come from the config file in Colima's ssbx profile
-# folder (`ssbx status` says where; see config.example).
-#
-# Works with the bash that ships with macOS (3.2) and with Linux.
-
-set -euo pipefail
-unset CDPATH
-
-
-# ------------------------------------------------------------- settings
-#
-# Defaults. The config file overrides them; config.example explains each.
-# It lives with the hosts file in the ssbx profile folder of Colima, next to
-# the VM's colima.yaml: ~/.config/colima/ssbx on Linux, ~/.colima/ssbx on
-# macOS, $COLIMA_HOME/ssbx if that is set. Found the same way Colima finds it.
-
-proxy="${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}"
-mounts=("$HOME")
-cpus=4
-memory=8
-disk=60
-permission_mode=""
-env=()
-packages=()
-docker_options=()
-log_file="$HOME/.local/state/ssbx/audit.jsonl"
-log="all"
-
-if [ -n "${COLIMA_HOME:-}" ]; then
-  colima_dir="$COLIMA_HOME"
-elif [ -d "$HOME/.colima" ]; then
-  colima_dir="$HOME/.colima"
-elif [ -n "${XDG_CONFIG_HOME:-}" ]; then
-  colima_dir="$XDG_CONFIG_HOME/colima"
-elif [ "$(uname -s)" = Darwin ]; then
-  colima_dir="$HOME/.colima"
-else
-  colima_dir="$HOME/.config/colima"
-fi
-config_dir="$colima_dir/ssbx"
-config_file="$config_dir/config"
-hosts_file="$config_dir/hosts"
-mkdir -p "$config_dir"
-
-if [ -f "$config_file" ]; then
-  # shellcheck disable=SC1090
-  . "$config_file"
-fi
-
-# A proxy on "localhost" is on your machine; from inside the VM that name is
-# host.docker.internal. Only the host part of the URL is touched. Colima itself
-# runs on your machine and gets the address as you wrote it.
-proxy_on_host="$proxy"
-if [ -n "$proxy" ]; then
-  proxy_rest="${proxy#*://}"
-  proxy_scheme="${proxy%%"$proxy_rest"}"
-  proxy_hostport="${proxy_rest##*@}"
-  proxy_userinfo="${proxy_rest%"$proxy_hostport"}"
-  proxy_host="${proxy_hostport%%[:/]*}"
-  proxy_port="${proxy_hostport#"$proxy_host"}"
-  case "$proxy_host" in
-    localhost | 127.0.0.1) proxy_host=host.docker.internal ;;
-  esac
-  proxy="$proxy_scheme$proxy_userinfo$proxy_host$proxy_port"
-fi
-
-# The audit log, the drop-in with the permission mode and a note of how the VM
-# was started live here. The proxy container writes the log to this folder.
-state_dir="$(dirname "$log_file")"
-log_name="$(basename "$log_file")"
-
-# Names of the Colima VM and of the Docker context Colima creates for it. The
-# containers, images, network and volume inside are all called ssbx too.
-profile="ssbx"
-context="colima-ssbx"
-
-# Where this script (and the Dockerfile next to it) really lives. ~/.local/bin/ssbx
-# is usually a symlink; readlink -f does not exist on older macOS.
-self="$0"
-while [ -L "$self" ]; do
-  target="$(readlink "$self")"
-  case "$target" in
-    /*) self="$target" ;;
-    *) self="$(dirname "$self")/$target" ;;
-  esac
-done
-script_dir="$(cd "$(dirname "$self")" && pwd -P)"
-
-docker() { command docker --context "$context" "$@"; }
-
-die() { echo "ssbx: $*" >&2; exit 1; }
-
-vm_state() {
-  { colima list 2>/dev/null || true; } | awk -v p="$profile" '$1 == p { print $2 }'
-}
-
-for tool in colima docker; do
-  command -v "$tool" >/dev/null 2>&1 || die "$tool is not installed (see the README)"
-done
-
-# On Linux, run QEMU without io_uring: QEMU 10.2 and later crash under network
-# load with the network device Lima uses. See lib/qemu-no-io-uring.
-if [ "$(uname -s)" = Linux ]; then
-  if command -v python3 >/dev/null 2>&1; then
-    export QEMU_SYSTEM_X86_64="$script_dir/lib/qemu-no-io-uring"
-    export QEMU_SYSTEM_AARCH64="$script_dir/lib/qemu-no-io-uring"
-  else
-    echo "ssbx: python3 is missing, so QEMU runs as it is; it may crash under network load (see lib/qemu-no-io-uring)" >&2
-  fi
-fi
-
-
-# ------------------------------------------------------------- commands
-#
-# Commands that do not need a project. `ssbx -- logs` runs a program called
-# logs inside instead.
-
-command=""
-case "${1:-}" in
-  -h | --help | help)
-    sed -n '3,14p' "$self" | sed 's/^# \{0,1\}//'
-    exit 0
-    ;;
-
-  stop)
-    colima stop --profile "$profile"
-    exit 0
-    ;;
-
-  status)
-    state="$(vm_state)"
-    echo "vm:       ${state:-not created}"
-    if [ "$state" = Running ]; then
-      for image in ssbx-proxy ssbx; do
-        if docker image inspect "$image" >/dev/null 2>&1; then
-          echo "image:    $image, built $(docker image inspect --format '{{.Created}}' "$image" | cut -c1-19)"
-        else
-          echo "image:    $image, not built"
-        fi
-      done
-      if docker container inspect ssbx-proxy >/dev/null 2>&1; then
-        echo "proxy:    $(docker container inspect --format '{{.State.Status}}' ssbx-proxy)"
-      else
-        echo "proxy:    not running"
-      fi
-    fi
-    echo "config:   $config_file$([ -f "$config_file" ] || echo ' (missing, using the defaults)')"
-    echo "hosts:    $hosts_file$([ -f "$hosts_file" ] || echo ' (missing, no tokens)')"
-    echo "log:      $log_file"
-    [ -n "$proxy" ] && echo "upstream: $proxy"
-    exit 0
-    ;;
-
-  logs)
-    [ -f "$log_file" ] || die "no log yet at $log_file"
-    echo "ssbx: $log_file" >&2
-    if command -v python3 >/dev/null 2>&1; then
-      exec tail -n 100 -F "$log_file" | python3 "$script_dir/lib/logs" "${2:-all}"
-    fi
-    exec tail -n 100 -F "$log_file"
-    ;;
-
-  reload)
-    if [ "$(vm_state)" = Running ]; then
-      docker rm --force --volumes ssbx-proxy >/dev/null 2>&1 || true
-    fi
-    echo "ssbx: the proxy starts again with the current settings on your next ssbx"
-    exit 0
-    ;;
-
-  rebuild)
-    command=rebuild
-    ;;
-
-  --)
-    shift
-    ;;
-esac
-
-
-# ------------------------------------------------------------- the project
-#
-# The sandbox gets the project you are in: the git repository if there is one,
-# otherwise the current directory. It has to be inside one of the mounts (see
-# config). It cannot be your home directory itself, nor anything under a
-# dot-folder of it: those hold your keys, your Claude login and ssbx itself.
-
-current_dir="$(pwd -P)"
-home_dir="$(cd "$HOME" && pwd -P)"
-project_dir="$current_dir"
-git_dir=""
-if command -v git >/dev/null 2>&1 && git -C "$current_dir" rev-parse --show-toplevel >/dev/null 2>&1; then
-  project_dir="$(git -C "$current_dir" rev-parse --show-toplevel)"
-  # A worktree or a submodule keeps its repository elsewhere; git needs it too.
-  git_dir="$(cd "$(git -C "$current_dir" rev-parse --git-common-dir)" && pwd -P)"
-  if [ "$project_dir" = "$home_dir" ]; then
-    project_dir="$current_dir"  # a repository in $HOME itself does not make every folder one project
-    git_dir=""
-  fi
-fi
-
-if [ "$command" != rebuild ]; then
-  case "$project_dir" in
-    "$home_dir" | / | "$home_dir"/.*)
-      die "run this inside a project, not in $project_dir"
-      ;;
-  esac
-  for private in "$config_dir" "$state_dir"; do
-    private="$(cd "$private" 2>/dev/null && pwd -P || echo "$private")"
-    case "$project_dir" in
-      "$private" | "$private"/*) die "run this inside a project, not in $project_dir" ;;
-    esac
-    case "$private" in
-      "$project_dir"/*) die "$private is inside the project; the sandbox must not see it" ;;
-    esac
-  done
-fi
-
-# Your ~/.claude goes into the sandbox as well (see "your settings" below), so
-# the VM has to see it too, and the folder the log is written to.
-if [ ! -d "$home_dir/.claude" ]; then
-  mkdir -p "$home_dir/.claude"
-  chmod 700 "$home_dir/.claude"
-fi
-claude_dir="$(cd "$home_dir/.claude" && pwd -P)"
-
-mount_options=()
-project_mounted=false
-state_mounted=false
-claude_mounted=false
-home_mounted=false
-for dir in ${mounts[@]+"${mounts[@]}"}; do
-  [ -d "$dir" ] || die "mount $dir from the config does not exist"
-  dir="$(cd "$dir" && pwd -P)"
-  mount_options+=(--mount "$dir:w")
-  case "$project_dir" in "$dir" | "$dir"/*) project_mounted=true ;; esac
-  case "$state_dir" in "$dir" | "$dir"/*) state_mounted=true ;; esac
-  case "$claude_dir" in "$dir" | "$dir"/*) claude_mounted=true ;; esac
-  [ "$dir" = "$home_dir" ] && home_mounted=true
-done
-if [ "$command" != rebuild ] && [ "$project_mounted" = false ]; then
-  die "$project_dir is outside the folders the sandbox can see (mounts in $config_file: ${mounts[*]+${mounts[*]}})"
-fi
-
-mkdir -p "$state_dir"
-chmod 700 "$state_dir"
-if [ "$state_mounted" = false ]; then
-  mount_options+=(--mount "$state_dir:w")
-fi
-if [ "$claude_mounted" = false ]; then
-  mount_options+=(--mount "$claude_dir:w")
-fi
-
-
-# ------------------------------------------------------------- the hosts file
-#
-# Checked here, so that a typo is reported with its line and not as a proxy
-# that will not start. The file holds tokens: it is made private if it is not.
-
-hosts=""
-if [ -f "$hosts_file" ]; then
-  chmod 600 "$hosts_file"
-  hosts="$(cat "$hosts_file")"
-  line_number=0
-  while read -r host kind token || [ -n "$host" ]; do
-    line_number=$((line_number + 1))
-    case "$host" in
-      "" | "#"*) continue ;;
-    esac
-    [ -n "$token" ] || die "$hosts_file line $line_number: expected 'host kind token'"
-    case "$kind" in
-      gitlab | github | atlassian | bearer) ;;
-      *) die "$hosts_file line $line_number: unknown kind '$kind' (gitlab, github, atlassian or bearer)" ;;
-    esac
-  done < "$hosts_file"
-else
-  echo "ssbx: no $hosts_file yet, so the sandbox has no tokens (see hosts.example)" >&2
-fi
-
-
-# ------------------------------------------------------------- the VM
-#
-# Start it if it is not running yet. --activate=false leaves your normal
-# Docker context as it is. The proxy from the config reaches the VM too, so
-# that image downloads work behind it. What the VM was started with is noted,
-# because Colima applies changes only at the next start.
-
-vm_config="cpus=$cpus memory=$memory disk=$disk mounts=${mount_options[*]}"
-
-state="$(vm_state)"
-if [ "$state" = Broken ]; then
-  echo "ssbx: the VM did not shut down cleanly last time, cleaning up" >&2
-  colima stop --force --profile "$profile" >/dev/null 2>&1 || true
-  state=Stopped
-fi
-
-if [ "$state" = Running ]; then
-  if [ "$(cat "$state_dir/vm" 2>/dev/null)" != "$vm_config" ]; then
-    die "the VM is running with older settings (mounts, cpus, memory or disk changed). Run: ssbx stop"
-  fi
-else
-  # Colima reads --env as a comma-separated list, so a comma in the proxy
-  # password goes in as %2C, which every client decodes again.
-  colima_env=()
-  if [ -n "$proxy" ]; then
-    vm_proxy="${proxy//,/%2C}"
-    colima_env=(--env "HTTP_PROXY=$vm_proxy" --env "HTTPS_PROXY=$vm_proxy"
-                --env "http_proxy=$vm_proxy" --env "https_proxy=$vm_proxy")
-  fi
-  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u NO_PROXY -u no_proxy \
-    ${proxy_on_host:+HTTP_PROXY="$proxy_on_host" HTTPS_PROXY="$proxy_on_host"} \
-    colima start --profile "$profile" \
-      --runtime docker --kubernetes=false \
-      --cpus "$cpus" --memory "$memory" --disk "$disk" \
-      "${mount_options[@]}" \
-      ${colima_env[@]+"${colima_env[@]}"} \
-      --activate=false --ssh-config=false
-  printf '%s' "$vm_config" > "$state_dir/vm"
-fi
-
-
-# ------------------------------------------------------------- the images
-#
-# Built on the first run, again when their sources change (after a git pull,
-# say), from scratch with `ssbx rebuild`. The proxy image is built first: it
-# creates the certificate that the agent image then copies from it. The
-# sandbox user is you: same uid and home path, so files it creates in the
-# project are yours and paths in your Claude settings keep working.
-
-uid="$(id -u)"
-gid="$(id -g)"
-user_name="$(id -un)"
-case "$user_name" in
-  [a-z_]*) ;;
-  *) user_name=agent ;;
-esac
-case "$user_name" in
-  *[!a-z0-9_-]*) user_name=agent ;;
-esac
-[ "$uid" != 0 ] || die "do not run this as root"
-
-build_inputs="$(for f in "$script_dir/Dockerfile" "$script_dir"/proxy/* "$script_dir"/sandbox/*; do
-  [ -f "$f" ] && { printf '%s %s\n' "${f#"$script_dir"/}" "$(wc -c < "$f")"; cat "$f"; }
-done | cksum | cut -d ' ' -f 1)"
-build_id="$build_inputs-$uid-$gid-$user_name-$HOME-${packages[*]+${packages[*]}}"
-
-build_args=(--build-arg "UID=$uid" --build-arg "GID=$gid" --label "ssbx.build=$build_id"
-            --add-host host.docker.internal:host-gateway)
-if [ -n "$proxy" ]; then
-  build_args+=(--build-arg "HTTP_PROXY=$proxy" --build-arg "HTTPS_PROXY=$proxy"
-               --build-arg "http_proxy=$proxy" --build-arg "https_proxy=$proxy")
-fi
-
-build() {
-  # If the agent image fails to build, the proxy image goes back to the one
-  # whose certificate the old agent image trusts.
-  docker tag ssbx-proxy ssbx-proxy:previous >/dev/null 2>&1 || true
-  docker build "$@" "${build_args[@]}" --target proxy --tag ssbx-proxy "$script_dir"
-  if ! docker build "$@" "${build_args[@]}" --target agent --tag ssbx \
-      --build-arg "USER_NAME=$user_name" --build-arg "HOME_DIR=$HOME" \
-      --build-arg "PACKAGES=${packages[*]+${packages[*]}}" "$script_dir"; then
-    docker tag ssbx-proxy:previous ssbx-proxy >/dev/null 2>&1 || true
-    die "the sandbox image did not build"
-  fi
-  # The running proxy still has the old certificate. It starts again below.
-  docker rm --force --volumes ssbx-proxy >/dev/null 2>&1 || true
-  docker rmi ssbx-proxy:previous >/dev/null 2>&1 || true
-}
-
-image_build() {
-  docker image inspect --format '{{ index .Config.Labels "ssbx.build" }}' "$1" 2>/dev/null || true
-}
-
-if [ "$command" = rebuild ]; then
-  build --no-cache
-  exit 0
-fi
-
-if [ "$(image_build ssbx)" != "$build_id" ] || [ "$(image_build ssbx-proxy)" != "$build_id" ]; then
-  echo "ssbx: building the images, this takes a few minutes the first time" >&2
-  build
-fi
-
-
-# ------------------------------------------------------------- the proxy
-#
-# The sandbox sits on an internal network with no way out, not even to the VM
-# (isolated mode). The proxy is on the normal network too, so it is the only
-# thing that can reach the internet. It is started again when the hosts file
-# or the settings it uses change (a checksum of them is kept as a label on the
-# container), or when it is not running for whatever reason.
-
-proxy_config="$(printf '%s\n%s\n%s\n%s\n%s' "$hosts" "$proxy" "$state_dir" "$log_name" "$build_id" | cksum | cut -d ' ' -f 1)"
-if docker container inspect ssbx-proxy >/dev/null 2>&1; then
-  running_config="$(docker container inspect --format '{{ index .Config.Labels "ssbx.config" }}' ssbx-proxy)"
-  running_state="$(docker container inspect --format '{{ .State.Status }}' ssbx-proxy)"
-  on_network="$(docker container inspect --format '{{ if index .NetworkSettings.Networks "ssbx" }}yes{{ end }}' ssbx-proxy)"
-  if [ "$running_config" != "$proxy_config" ] || [ "$running_state" != running ] || [ "$on_network" != yes ]; then
-    docker rm --force --volumes ssbx-proxy >/dev/null 2>&1 || true
-  fi
-fi
-
-if docker network inspect ssbx >/dev/null 2>&1 \
-   && [ "$(docker network inspect --format '{{ index .Options "com.docker.network.bridge.gateway_mode_ipv4" }}' ssbx)" != isolated ]; then
-  docker rm --force --volumes ssbx-proxy >/dev/null 2>&1 || true
-  docker network rm ssbx >/dev/null
-fi
-if ! docker network inspect ssbx >/dev/null 2>&1; then
-  docker network create --internal --opt com.docker.network.bridge.gateway_mode_ipv4=isolated ssbx >/dev/null
-fi
-
-if ! docker container inspect ssbx-proxy >/dev/null 2>&1; then
-  docker create \
-    --name ssbx-proxy \
-    --restart unless-stopped \
-    --label "ssbx.config=$proxy_config" \
-    --cap-drop ALL \
-    --security-opt no-new-privileges \
-    --add-host host.docker.internal:host-gateway \
-    --env SSBX_HOSTS="$hosts" \
-    --env SSBX_UPSTREAM="$proxy" \
-    --env SSBX_LOG_FILE="/ssbx/state/$log_name" \
-    --volume "$state_dir:/ssbx/state" \
-    ssbx-proxy >/dev/null
-  docker network connect --alias proxy ssbx ssbx-proxy
-  docker start ssbx-proxy >/dev/null
-
-  # Wait until it listens. If it does not, say why instead of starting a
-  # sandbox that cannot reach anything.
-  tries=0
-  until docker exec ssbx-proxy python3 -c 'import socket; socket.create_connection(("127.0.0.1", 8080), 1)' >/dev/null 2>&1; do
-    tries=$((tries + 1))
-    if [ "$tries" -ge 20 ] || [ "$(docker container inspect --format '{{ .State.Status }}' ssbx-proxy)" != running ]; then
-      docker logs --tail 20 ssbx-proxy >&2 || true
-      docker rm --force --volumes ssbx-proxy >/dev/null 2>&1 || true
-      die "the proxy did not start; check the hosts file and the proxy setting in $config_file"
-    fi
-    sleep 0.5
-  done
-fi
-
-
-# ------------------------------------------------------------- your settings
-#
-# Your ~/.claude and ~/.claude.json are mounted into the sandbox, not copied:
-# login, settings, skills, plugins, MCP servers, history and the transcripts
-# of the sessions run inside are the same files as on your machine. (On macOS
-# the login is in the Keychain, which the sandbox cannot see: log in once
-# inside, the file Claude writes then stays in the mounted folder.) Colima
-# mounts folders, not files, so ~/.claude.json can only be shared when your
-# home directory is one of the mounts.
-
-claude_options=(--volume "$claude_dir:$HOME/.claude")
-if [ ! -f "$home_dir/.claude.json" ]; then
-  echo "ssbx: there is no ~/.claude.json on your machine yet, so the sandbox keeps its own until there is" >&2
-elif [ "$home_mounted" = false ]; then
-  echo "ssbx: ~/.claude.json is not shared with the sandbox, because your home directory is not in mounts" >&2
-else
-  claude_options+=(--volume "$home_dir/.claude.json:$HOME/.claude.json")
-fi
-
-# The permission mode from the config, as a managed setting no settings file
-# inside can override, and what the audit hook should report. Mounted
-# read-only into the sandbox.
-{
-  printf '{ "env": { "SSBX_LOG": "%s" }' "$log"
-  if [ -n "$permission_mode" ]; then
-    printf ', "permissions": { "defaultMode": "%s" }' "$permission_mode"
-  fi
-  printf ' }\n'
-} > "$state_dir/managed.json"
-
-
-# ------------------------------------------------------------- git
-#
-# Remotes like git@gitlab.com:group/repo.git would try SSH, which has no way
-# out of the sandbox. For every host in the hosts file, git inside the
-# sandbox rewrites them to https://gitlab.com/group/repo.git. Commits inside
-# are signed with your name and email, if git on your machine knows them.
-
-git_settings=()
-count=0
-
-if [ -f "$hosts_file" ]; then
-  while read -r host _ || [ -n "$host" ]; do
-    case "$host" in
-      "" | "#"*) continue ;;
-    esac
-    git_settings+=(--env "GIT_CONFIG_KEY_$count=url.https://$host/.insteadOf")
-    git_settings+=(--env "GIT_CONFIG_VALUE_$count=git@$host:")
-    count=$((count + 1))
-    git_settings+=(--env "GIT_CONFIG_KEY_$count=url.https://$host/.insteadOf")
-    git_settings+=(--env "GIT_CONFIG_VALUE_$count=ssh://git@$host/")
-    count=$((count + 1))
-  done < "$hosts_file"
-fi
-
-git_settings+=(--env "GIT_CONFIG_COUNT=$count")
-
-if command -v git >/dev/null 2>&1; then
-  git_name="$(git config --get user.name 2>/dev/null || true)"
-  git_email="$(git config --get user.email 2>/dev/null || true)"
-  [ -n "$git_name" ] && git_settings+=(--env "GIT_AUTHOR_NAME=$git_name" --env "GIT_COMMITTER_NAME=$git_name")
-  [ -n "$git_email" ] && git_settings+=(--env "GIT_AUTHOR_EMAIL=$git_email" --env "GIT_COMMITTER_EMAIL=$git_email")
-fi
-
-
-# ------------------------------------------------------------- the sandbox
-#
-# --cap-drop ALL and no-new-privileges: nobody inside can become root.
-# The ssbx-home volume is the home directory inside, at the same path as on
-# your machine, with your ~/.claude and the project mounted into it at the
-# paths they have on your machine. The proxy variables are given again here:
-# a proxies section in ~/.docker/config.json would otherwise replace the ones
-# from the image.
-
-run_options=(
-  --rm --interactive --init
-  --hostname ssbx
-  --network ssbx
-  --cap-drop ALL
-  --security-opt no-new-privileges
-  --volume "ssbx-home:$HOME"
-  "${claude_options[@]}"
-  --volume "$project_dir:$project_dir"
-  --volume "$state_dir/managed.json:/etc/claude-code/managed-settings.d/50-ssbx.json:ro"
-  --workdir "$current_dir"
-  --env HTTP_PROXY=http://proxy:8080 --env HTTPS_PROXY=http://proxy:8080
-  --env http_proxy=http://proxy:8080 --env https_proxy=http://proxy:8080
-  --env NO_PROXY=localhost,127.0.0.1 --env no_proxy=localhost,127.0.0.1
-  "${git_settings[@]}"
-)
-
-case "$git_dir" in
-  "$project_dir" | "$project_dir"/*) ;;
-  "") ;;
-  *) run_options+=(--volume "$git_dir:$git_dir") ;;
-esac
-
-for variable in ${env[@]+"${env[@]}"}; do
-  run_options+=(--env "$variable")
-done
-run_options+=(${docker_options[@]+"${docker_options[@]}"})
-
-# A terminal only when ssbx itself runs in one, so `ssbx some-command` also
-# works from scripts.
-if [ -t 0 ] && [ -t 1 ]; then
-  run_options+=(--tty)
-fi
-
-unset -f docker
-if [ "$#" -eq 0 ]; then
-  exec docker --context "$context" run "${run_options[@]}" ssbx bash
-else
-  exec docker --context "$context" run "${run_options[@]}" ssbx "$@"
-fi
+#!/usr/bin/env python3
+"""
+ssbx: run Claude Code in a Lima VM that can only reach the hosts you allow.
+
+  ssbx [command ...]   start what is needed and run the command in the VM,
+                       in the project you are in (default: claude)
+  ssbx shell           a shell in the VM
+  ssbx status          what is running and where the files are
+  ssbx logs [blocked]  follow the audit log (blocked: refusals only, with
+                       the config snippet that would allow each)
+  ssbx check METHOD URL   would the proxy let this request through?
+  ssbx reload          restart the proxy after editing the [hosts] tables
+  ssbx stop            stop the VM and the proxy (needed after changing
+                       cpus, memory, disk, mounts or packages)
+  ssbx rebuild         delete the VM and make it again; the config stays
+
+Everything is configured in one file, ~/.lima/_config/ssbx.toml, created
+from ssbx.example.toml on the first run. The proxy runs on your machine and
+holds your tokens; the VM sees only the proxy and the folders you mount.
+"""
+
+import hashlib
+import json
+import os
+import platform
+import pwd
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+if sys.version_info < (3, 11):
+    sys.exit("ssbx needs Python 3.11 or newer (for tomllib)")
+
+import tomllib  # noqa: E402
+
+REPO = Path(__file__).resolve().parent
+sys.path.insert(0, str(REPO / "proxy"))
+import rules  # noqa: E402
+
+INSTANCE = "ssbx"
+MACOS = platform.system() == "Darwin"
+LIMA_HOME = Path(os.environ.get("LIMA_HOME") or Path.home() / ".lima")
+CONFIG_FILE = LIMA_HOME / "_config" / "ssbx.toml"
+STATE = LIMA_HOME / "_config" / "ssbx"
+SHARE = STATE / "share"
+CA_DIR = STATE / "ca"
+TEMPLATE_OUT = LIMA_HOME / "_templates" / "ssbx.yaml"
+INSTANCE_DIR = LIMA_HOME / INSTANCE
+EXTRA_PATH = ["/opt/homebrew/bin", "/usr/local/bin", str(Path.home() / ".local" / "bin"),
+              "/usr/lib", "/usr/libexec", "/usr/lib/qemu", "/usr/libexec/qemu"]  # tools, and virtiofsd
+
+PERMISSION_MODES = ("", "bypassPermissions", "auto", "acceptEdits", "default", "plan")
+KNOWN_KEYS = {"mounts", "cpus", "memory", "disk", "permission_mode", "env", "packages", "proxy", "log",
+              "log_file", "proxy_port", "hosts"}
+
+
+def die(*message):
+    print("ssbx:", *message, file=sys.stderr)
+    sys.exit(1)
+
+
+def say(*message):
+    print("ssbx:", *message, file=sys.stderr, flush=True)
+
+
+# ------------------------------------------------------------------ config
+
+def load_config():
+    """ssbx.toml as a dict with every key present and checked."""
+    if not CONFIG_FILE.exists():
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(REPO / "ssbx.example.toml", CONFIG_FILE)
+        say(f"created {CONFIG_FILE} from the example; edit it to add your hosts and tokens")
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except OSError:
+        pass
+    try:
+        with open(CONFIG_FILE, "rb") as f:
+            raw = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        die(f"{CONFIG_FILE}: {e}")
+    except OSError as e:
+        die(f"cannot read {CONFIG_FILE}: {e}")
+
+    unknown = set(raw) - KNOWN_KEYS
+    if unknown:
+        die(f"{CONFIG_FILE}: unknown setting(s) {sorted(unknown)}; see ssbx.example.toml")
+
+    def want(key, kind, default):
+        value = raw.get(key, default)
+        if not isinstance(value, kind) or isinstance(value, bool):
+            die(f"{CONFIG_FILE}: {key} has the wrong type; see ssbx.example.toml")
+        return value
+
+    cfg = {}
+    mounts = want("mounts", list, ["~/Work"])
+    if not mounts or not all(isinstance(m, str) and m.strip() for m in mounts):
+        die(f"{CONFIG_FILE}: mounts must be a non-empty list of folders")
+    cfg["mounts"] = []
+    for m in mounts:
+        path = Path(os.path.expanduser(m)).resolve()
+        if not path.is_dir():
+            die(f"{CONFIG_FILE}: mount {m} is not a directory")
+        if path == Path.home() or path in Path.home().parents:
+            die(f"{CONFIG_FILE}: mounting {m} would give the sandbox your whole home; list the folders you work in")
+        cfg["mounts"].append(str(path))
+    cfg["cpus"] = want("cpus", int, 4)
+    cfg["memory"] = want("memory", (int, float), 8)
+    cfg["disk"] = want("disk", int, 60)
+    if cfg["cpus"] < 1 or cfg["memory"] < 1 or cfg["disk"] < 10:
+        die(f"{CONFIG_FILE}: cpus, memory and disk are too small")
+    cfg["permission_mode"] = want("permission_mode", str, "")
+    if cfg["permission_mode"] not in PERMISSION_MODES:
+        die(f"{CONFIG_FILE}: permission_mode must be one of " + ", ".join(m or '""' for m in PERMISSION_MODES))
+    env = want("env", dict, {})
+    for k, v in env.items():
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k) or not isinstance(v, (str, int, float)):
+            die(f"{CONFIG_FILE}: env.{k} must be a string")
+    cfg["env"] = {k: str(v) for k, v in env.items()}
+    packages = want("packages", list, [])
+    for p in packages:
+        if not isinstance(p, str) or not re.fullmatch(r"[a-z0-9][a-z0-9.+-]*", p):
+            die(f"{CONFIG_FILE}: packages must be Debian package names")
+    cfg["packages"] = packages
+    cfg["proxy"] = want("proxy", str, "").strip()
+    if cfg["proxy"] and not re.fullmatch(r"https?://[^\s/]+", cfg["proxy"]):
+        die(f"{CONFIG_FILE}: proxy must look like http://host:port or http://user:pass@host:port")
+    cfg["log"] = want("log", str, "all")
+    if cfg["log"] not in ("all", "blocked"):
+        die(f'{CONFIG_FILE}: log must be "all" or "blocked"')
+    cfg["log_file"] = str(Path(os.path.expanduser(want("log_file", str, str(STATE / "audit.jsonl")))).resolve())
+    cfg["proxy_port"] = want("proxy_port", int, 17080)
+    if not 1024 <= cfg["proxy_port"] <= 65535:
+        die(f"{CONFIG_FILE}: proxy_port must be between 1024 and 65535")
+    try:
+        cfg["rules"] = rules.load(raw.get("hosts"))
+    except rules.ConfigError as e:
+        die(f"{CONFIG_FILE}: {e}")
+    cfg["hosts_raw"] = raw.get("hosts") or {}
+    return cfg
+
+
+# ------------------------------------------------------------------ tools
+
+def find_tool(name):
+    for directory in os.environ.get("PATH", "").split(os.pathsep) + EXTRA_PATH:
+        candidate = Path(directory) / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def require_tools():
+    limactl = find_tool("limactl")
+    if not limactl:
+        die("limactl not found. Install Lima: brew install lima (macOS), or see https://lima-vm.io/docs/installation/")
+    mitmdump = find_tool("mitmdump")
+    if not mitmdump:
+        die("mitmdump not found. Install mitmproxy: uv tool install mitmproxy, pipx install mitmproxy, or brew install mitmproxy")
+    return limactl, mitmdump
+
+
+def lima_env():
+    """PATH for limactl: the io_uring-free QEMU wrapper first (Linux), and the
+    places where virtiofsd usually lives."""
+    env = dict(os.environ)
+    parts = [str(STATE / "bin")] if not MACOS else []
+    parts += env.get("PATH", "").split(os.pathsep) + EXTRA_PATH
+    env["PATH"] = os.pathsep.join(dict.fromkeys(p for p in parts if p))
+    return env
+
+
+def qemu_wrapper():
+    """A qemu-system-<arch> in STATE/bin that runs the real one without io_uring."""
+    if MACOS:
+        return
+    machine = platform.machine()
+    name = f"qemu-system-{'aarch64' if machine in ('arm64', 'aarch64') else machine}"
+    (STATE / "bin").mkdir(parents=True, exist_ok=True)
+    link = STATE / "bin" / name
+    target = REPO / "lib" / "qemu-no-io-uring"
+    if not (link.is_symlink() and os.readlink(link) == str(target)):
+        if link.exists() or link.is_symlink():
+            link.unlink()
+        link.symlink_to(target)
+
+
+def mount_type():
+    if MACOS:
+        return "virtiofs"
+    if find_tool("virtiofsd"):
+        return "virtiofs"
+    say("virtiofsd is not installed, using the slower 9p mounts (Arch: pacman -S virtiofsd, Debian: apt install virtiofsd)")
+    return "9p"
+
+
+def limactl(*args, check=True, capture=False):
+    cmd = [find_tool("limactl")] + list(args)
+    return subprocess.run(cmd, env=lima_env(), check=check, text=True, capture_output=capture)
+
+
+def vm_status():
+    """Running, Stopped, Broken, or None when there is no VM."""
+    result = limactl("list", "--json", INSTANCE, capture=True, check=False)
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            info = json.loads(line)
+        except ValueError:
+            continue
+        if info.get("name") == INSTANCE:
+            return info.get("status") or "Stopped"
+    return None
+
+
+# ------------------------------------------------------------------ the proxy
+
+def proxy_pid():
+    try:
+        pid = int((STATE / "proxy.pid").read_text().strip())
+        os.kill(pid, 0)
+    except (OSError, ValueError):
+        return None
+    try:  # is it still our mitmdump, not a reused pid?
+        cmdline = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True).stdout
+    except OSError:
+        cmdline = "mitmdump"
+    return pid if "mitmdump" in cmdline else None
+
+
+def port_open(port):
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def proxy_fingerprint(cfg):
+    material = json.dumps([cfg["hosts_raw"], cfg["proxy"], cfg["proxy_port"], cfg["log_file"]], sort_keys=True)
+    for name in ("addon.py", "rules.py"):
+        material += (REPO / "proxy" / name).read_text()
+    return hashlib.sha256(material.encode()).hexdigest()
+
+
+def stop_proxy():
+    pid = proxy_pid()
+    if pid:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(50):
+            time.sleep(0.1)
+            if proxy_pid() is None:
+                break
+        else:
+            os.kill(pid, signal.SIGKILL)
+    (STATE / "proxy.pid").unlink(missing_ok=True)
+
+
+def start_proxy(cfg, mitmdump, force=False):
+    """Start mitmdump with the addon, or leave it if it runs the current config."""
+    fingerprint = proxy_fingerprint(cfg)
+    stamp = STATE / "proxy.fingerprint"
+    if not force and proxy_pid() and port_open(cfg["proxy_port"]) and stamp.exists() and stamp.read_text() == fingerprint:
+        return
+    stop_proxy()
+    if port_open(cfg["proxy_port"]):
+        die(f"something else listens on 127.0.0.1:{cfg['proxy_port']}; change proxy_port in {CONFIG_FILE}")
+    Path(cfg["log_file"]).parent.mkdir(parents=True, exist_ok=True)
+    CA_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(CA_DIR, 0o700)
+    cmd = [mitmdump, "-q", "--listen-host", "127.0.0.1", "--listen-port", str(cfg["proxy_port"]),
+           "--set", f"confdir={CA_DIR}", "--set", "connection_strategy=lazy", "--set", "stream_large_bodies=1m",
+           "-s", str(REPO / "proxy" / "addon.py")]
+    if cfg["proxy"]:
+        m = re.fullmatch(r"(https?://)(?:([^@/]+)@)?([^@/]+)", cfg["proxy"])
+        cmd += ["--mode", f"upstream:{m.group(1)}{m.group(3)}"]
+        if m.group(2):
+            cmd += ["--upstream-auth", m.group(2)]
+    env = dict(os.environ, SSBX_CONFIG=str(CONFIG_FILE), SSBX_LOG_FILE=cfg["log_file"])
+    with open(STATE / "proxy.log", "ab") as log:
+        process = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                   start_new_session=True, close_fds=True)
+    (STATE / "proxy.pid").write_text(str(process.pid))
+    for _ in range(100):
+        if port_open(cfg["proxy_port"]):
+            break
+        if process.poll() is not None:
+            tail = (STATE / "proxy.log").read_text(errors="replace").splitlines()[-8:]
+            die("the proxy did not start:\n  " + "\n  ".join(tail))
+        time.sleep(0.15)
+    else:
+        die(f"the proxy did not answer on port {cfg['proxy_port']}; see {STATE / 'proxy.log'}")
+    stamp.write_text(fingerprint)
+    say(f"proxy started on 127.0.0.1:{cfg['proxy_port']}")
+
+
+# ------------------------------------------------------------------ the VM
+
+def write_share(cfg):
+    """The read-only folder the VM sees at /ssbx."""
+    SHARE.mkdir(parents=True, exist_ok=True)
+    proxy_url = f"http://host.lima.internal:{cfg['proxy_port']}"
+    managed = {"env": {"SSBX_LOG": cfg["log"]}}
+    if cfg["permission_mode"]:
+        managed["permissions"] = {"defaultMode": cfg["permission_mode"]}
+    (SHARE / "managed.json").write_text(json.dumps(managed, indent=2) + "\n")
+    settings = (REPO / "vm" / "managed-settings.json").read_text().replace("{{proxy}}", proxy_url)
+    (SHARE / "managed-settings.json").write_text(settings)
+    shutil.copyfile(REPO / "vm" / "audit-hook", SHARE / "audit-hook")
+    ca = CA_DIR / "mitmproxy-ca-cert.pem"
+    if not ca.is_file() or ca.stat().st_size == 0:
+        die(f"the proxy has no certificate yet ({ca}); see {STATE / 'proxy.log'}")
+    shutil.copyfile(ca, SHARE / "ssbx-ca.crt")
+    for f in SHARE.iterdir():
+        os.chmod(f, 0o644)
+
+
+def render_template(cfg):
+    """vm/ssbx.yaml with the values from ssbx.toml (JSON is valid YAML)."""
+    port = cfg["proxy_port"]
+    proxy_url = f"http://host.lima.internal:{port}"
+    env = {"HTTP_PROXY": proxy_url, "HTTPS_PROXY": proxy_url, "http_proxy": proxy_url, "https_proxy": proxy_url,
+           "NO_PROXY": "localhost,127.0.0.1", "no_proxy": "localhost,127.0.0.1",
+           "SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt", "REQUESTS_CA_BUNDLE": "/etc/ssl/certs/ca-certificates.crt",
+           "NODE_EXTRA_CA_CERTS": "/usr/local/share/ca-certificates/ssbx-ca.crt", "DISABLE_AUTOUPDATER": "1"}
+    claude_dir = Path.home() / ".claude"
+    claude_dir.mkdir(mode=0o700, exist_ok=True)
+    mounts = [{"location": m, "writable": True} for m in cfg["mounts"]]
+    if not any(str(claude_dir) == m or str(claude_dir).startswith(m + "/") for m in cfg["mounts"]):
+        mounts.append({"location": str(claude_dir), "writable": True})
+    mounts.append({"location": str(SHARE), "mountPoint": "/ssbx", "writable": False})
+    provision = (REPO / "vm" / "provision.sh").read_text()
+    values = {
+        "image": "debian-13",
+        "vm_type": "vz" if MACOS else "qemu",
+        "cpus": cfg["cpus"],
+        "memory": f"{cfg['memory']}GiB",
+        "disk": f"{cfg['disk']}GiB",
+        "mount_type": mount_type(),
+        "mounts": mounts,
+        "env": env,
+        "home": str(Path.home()),
+        "proxy_port": str(port),
+        "upstream": cfg["proxy"],
+        "packages": " ".join(cfg["packages"]),
+        "user": pwd.getpwuid(os.getuid()).pw_name,
+        "provision": "\n".join("    " + line if line else "" for line in provision.splitlines()),
+    }
+    text = (REPO / "vm" / "ssbx.yaml").read_text()
+    for key, value in values.items():
+        text = text.replace("{{" + key + "}}", value if key in ("provision", "image") else json.dumps(value))
+    return text
+
+
+def ensure_vm(cfg):
+    """Create, update or start the VM so that it matches ssbx.toml."""
+    qemu_wrapper()
+    rendered = render_template(cfg)
+    TEMPLATE_OUT.parent.mkdir(parents=True, exist_ok=True)
+    TEMPLATE_OUT.write_text(rendered)
+    applied = STATE / "lima.yaml.applied"
+    status = vm_status()
+
+    if status is None:
+        say("creating the VM, this downloads the Debian image the first time")
+        limactl("create", "--tty=false", "--name", INSTANCE, str(TEMPLATE_OUT))
+        applied.write_text(rendered)
+        status = "Stopped"
+    elif status == "Broken":
+        say("the VM was left in a broken state, stopping it")
+        limactl("stop", "-f", INSTANCE, check=False)
+        status = "Stopped"
+
+    if not applied.exists() or applied.read_text() != rendered:
+        if status == "Running":
+            die("the VM runs with older settings (cpus, memory, disk, mounts, packages or the VM template changed). Run: ssbx stop")
+        # The instance file has to be self-contained: the base template resolved into it.
+        resolved = STATE / "lima.yaml.resolved"
+        limactl("template", "copy", "--embed-all", "--tty=false", str(TEMPLATE_OUT), str(resolved))
+        shutil.copyfile(resolved, INSTANCE_DIR / "lima.yaml")
+        applied.write_text(rendered)
+        say("VM settings updated")
+
+    if status != "Running":
+        say("starting the VM")
+        result = limactl("start", "--tty=false", INSTANCE, check=False)
+        if result.returncode != 0:
+            die("the VM did not start; try: ssbx stop, then ssbx again, or ssbx rebuild")
+
+
+def project():
+    """(project dir, a git directory outside it that has to be mounted too or None)."""
+    cwd = Path.cwd().resolve()
+    top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    project_dir = Path(top.stdout.strip()).resolve() if top.returncode == 0 and top.stdout.strip() else cwd
+    common = subprocess.run(["git", "rev-parse", "--git-common-dir"], capture_output=True, text=True)
+    extra = None
+    if common.returncode == 0 and common.stdout.strip():
+        git_dir = (cwd / common.stdout.strip()).resolve()
+        if git_dir != project_dir / ".git" and not str(git_dir).startswith(str(project_dir) + "/"):
+            extra = git_dir
+    return project_dir, extra
+
+
+def inside_mounts(path, cfg):
+    return any(str(path) == m or str(path).startswith(m + "/") for m in cfg["mounts"])
+
+
+def run_in_vm(cfg, command, workdir):
+    env_args = []
+    for key, setting in (("GIT_AUTHOR_NAME", "user.name"), ("GIT_AUTHOR_EMAIL", "user.email"),
+                         ("GIT_COMMITTER_NAME", "user.name"), ("GIT_COMMITTER_EMAIL", "user.email")):
+        value = subprocess.run(["git", "config", "--get", setting], capture_output=True, text=True).stdout.strip()
+        if value:
+            env_args.append(f"{key}={value}")
+    env_args += [f"{k}={v}" for k, v in cfg["env"].items()]
+    args = ["shell", "--workdir", str(workdir), INSTANCE, "--"]
+    if env_args:
+        args += ["env"] + env_args
+    args += command
+    os.execve(find_tool("limactl"), ["limactl"] + args, lima_env())
+
+
+# ------------------------------------------------------------------ commands
+
+def cmd_run(cfg, command):
+    _, mitmdump = require_tools()
+    STATE.mkdir(parents=True, exist_ok=True)
+    os.chmod(STATE, 0o700)
+    project_dir, extra = project()
+    if not inside_mounts(project_dir, cfg):
+        die(f"{project_dir} is not inside any of your mounts ({', '.join(cfg['mounts'])}); add it to mounts in {CONFIG_FILE}")
+    if extra and not inside_mounts(extra, cfg):
+        die(f"this worktree's git directory {extra} is not inside your mounts; add it in {CONFIG_FILE}")
+    start_proxy(cfg, mitmdump)
+    write_share(cfg)
+    ensure_vm(cfg)
+    run_in_vm(cfg, command, project_dir)
+
+
+def cmd_stop(cfg):
+    require_tools()
+    if vm_status() not in (None, "Stopped"):
+        limactl("stop", INSTANCE, check=False)
+    stop_proxy()
+    say("stopped")
+
+
+def cmd_status(cfg):
+    require_tools()
+    pid = proxy_pid()
+    print(f"config:   {CONFIG_FILE}")
+    print(f"log:      {cfg['log_file']}")
+    print(f"state:    {STATE}")
+    print(f"vm:       {vm_status() or 'not created'} ({'vz' if MACOS else 'qemu'}, {mount_type()} mounts)")
+    print(f"proxy:    {'running, pid ' + str(pid) + ', 127.0.0.1:' + str(cfg['proxy_port']) if pid else 'stopped'}"
+          + (f" (upstream {re.sub(r'//[^@]*@', '//***@', cfg['proxy'])})" if cfg["proxy"] else ""))
+    print(f"mounts:   {', '.join(cfg['mounts'])}")
+    modes = {"tunnel": [], "intercept": [], "token": []}
+    for host in cfg["rules"].hosts():
+        modes[host.mode].append(host.name)
+    for mode, names in modes.items():
+        print(f"{mode + ':':<10} {', '.join(sorted(names)) or '-'}")
+    for warning in cfg["rules"].warnings():
+        print(f"warning:  {warning}")
+
+
+def cmd_reload(cfg):
+    _, mitmdump = require_tools()
+    STATE.mkdir(parents=True, exist_ok=True)
+    start_proxy(cfg, mitmdump, force=True)
+    write_share(cfg)
+    say("proxy restarted with the current hosts; permission_mode and log apply to the next Claude session")
+
+
+def cmd_rebuild(cfg):
+    require_tools()
+    if vm_status() is not None:
+        answer = input("ssbx: delete the VM and create it again? What was installed inside is lost; your config and folders stay. [y/N] ")
+        if answer.strip().lower() != "y":
+            die("not rebuilt")
+        limactl("delete", "-f", INSTANCE)
+    (STATE / "lima.yaml.applied").unlink(missing_ok=True)
+    cmd_run(cfg, ["true"])
+
+
+def cmd_check(cfg, args):
+    if len(args) != 2:
+        die("usage: ssbx check METHOD URL")
+    method, url = args[0].upper(), args[1]
+    m = re.fullmatch(r"(https?)://([^/:]+)(?::(\d+))?(/.*)?", url)
+    if not m:
+        die("the URL must look like https://host/path")
+    scheme, host, path = m.group(1), m.group(2), m.group(4) or "/"
+    port = int(m.group(3) or (443 if scheme == "https" else 80))
+    entry = cfg["rules"].find(host)
+    reason = rules.why_unusual_path(path)
+    if (scheme == "http" and port != 80) or (scheme == "https" and port != 443):
+        decision = rules.Decision(False, f"port {port} is not reachable, only 80 for http and 443 for https")
+    elif reason:
+        decision = rules.Decision(False, reason)
+    elif entry is not None and entry.token is not None and scheme == "http":
+        decision = rules.Decision(False, "a host with a token is only reachable over HTTPS")
+    elif entry is not None and entry.token is not None and rules.hands_out_credentials(path):
+        decision = rules.Decision(False, "that endpoint hands out credentials")
+    else:
+        git = rules.git_request(method, path, "application/x-git-upload-pack-request") \
+            or rules.git_request(method, path, "application/x-git-receive-pack-request")
+        if git:
+            decision = cfg["rules"].decide(host, method, git[1], git=git[0])
+        elif rules.is_graphql_path(path):
+            decision = cfg["rules"].decide(host, method, path, graphql=[("query", [])])
+            if decision.allowed:
+                decision.reason += " (queries; mutations only by name in mutations = [...])"
+        else:
+            decision = cfg["rules"].decide(host, method, path)
+    print(("allowed: " if decision.allowed else "blocked: ") + decision.reason + (f"  [{decision.rule}]" if decision.rule else ""))
+    if decision.suggest:
+        print(f"to allow it, add to {CONFIG_FILE}:\n{decision.suggest}")
+    sys.exit(0 if decision.allowed else 1)
+
+
+# ------------------------------------------------------------------ logs
+
+CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+BLOCKED_EVENTS = {"blocked", "denied", "tool_failed"}
+
+
+def brief(value):
+    """One line for a tool input: the command, the file, or the keys."""
+    if not isinstance(value, dict):
+        return str(value)
+    for key in ("command", "file_path", "pattern", "url", "prompt", "description", "query"):
+        if key in value:
+            text = str(value[key]).replace("\n", " ")
+            return text if len(text) <= 120 else text[:120] + "…"
+    return ", ".join(value.keys())
+
+
+def format_event(event):
+    ts = str(event.get("ts", ""))[11:19]
+    kind = event.get("event", "?")
+    source = event.get("source", "?")
+    if kind == "blocked":
+        what = f"{event.get('method')} {event.get('host')}{event.get('path', '')}  ({event.get('reason')})"
+        if event.get("repeated"):
+            what += f"  x{event['repeated'] + 1}"
+        kind = "BLOCKED"
+    elif kind == "allowed":
+        what = f"{event.get('method')} {event.get('host')}{event.get('path', '')}"
+        if event.get("count"):
+            what += f"  x{event['count']}"
+    elif kind == "passthrough":
+        what = f"{event.get('host')}:{event.get('port')}" + (f"  x{event['count']}" if event.get("count") else "")
+    elif kind == "rules":
+        what = (f"{len(event.get('tunnel', []))} tunnel, {len(event.get('intercept', []))} intercepted, "
+                f"{len(event.get('token', []))} with token" + ("; " + "; ".join(event["warnings"]) if event.get("warnings") else ""))
+    elif kind == "denied":
+        what = f"{event.get('tool')}: {brief(event.get('input'))}  ({event.get('reason')})"
+        kind = "DENIED"
+    elif kind == "tool_failed":
+        error = str(event.get("error", "")).replace("\n", " ")
+        what = f"{event.get('tool')}: {brief(event.get('input'))}  ({error[:160]})"
+        kind = "FAILED"
+    elif kind in ("tool", "asked"):
+        what = f"{event.get('tool')}: {brief(event.get('input'))}"
+    elif kind == "prompt":
+        what = str(event.get("text", "")).replace("\n", " ")
+    elif kind == "session_start":
+        what = f"{event.get('how')} in {event.get('cwd')}" + (f" ({event['mode']})" if event.get("mode") else "")
+    elif kind == "session_end":
+        what = str(event.get("reason"))
+    elif kind == "dropped":
+        what = f"{event.get('count')} events ({event.get('reason')})"
+    else:
+        what = json.dumps({k: v for k, v in event.items() if k not in ("ts", "event", "source")})
+    line = f"{ts}  {source:<8} {kind:<13} {what}"
+    return CONTROL.sub(lambda m: "\\x%02x" % ord(m.group()), line)  # nothing from the sandbox drives your terminal
+
+
+def cmd_logs(cfg, only_blocked):
+    path = Path(cfg["log_file"])
+    if not path.exists():
+        die(f"no log yet at {path}")
+    say(f"{path}" + (" (refusals only)" if only_blocked else "") + ", Ctrl-C to stop")
+
+    def show(raw):
+        raw = raw.strip()
+        if not raw:
+            return
+        try:
+            event = json.loads(raw)
+        except ValueError:
+            print(CONTROL.sub("?", raw), flush=True)
+            return
+        if only_blocked and event.get("event") not in BLOCKED_EVENTS:
+            return
+        print(format_event(event), flush=True)
+        if only_blocked and event.get("suggest"):
+            snippet = "\n".join("            " + line for line in event["suggest"].splitlines())
+            print("          to allow it, add to ssbx.toml:\n" + snippet, flush=True)
+
+    f = open(path, encoding="utf-8", errors="replace")
+    try:
+        for raw in f:
+            show(raw)
+        while True:
+            raw = f.readline()
+            if raw:
+                show(raw)
+                continue
+            time.sleep(0.5)
+            if not path.exists() or os.fstat(f.fileno()).st_ino != path.stat().st_ino:
+                f.close()  # rotated: start again from the new file
+                f = open(path, encoding="utf-8", errors="replace")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        f.close()
+
+
+# ------------------------------------------------------------------ main
+
+def main(argv):
+    command = argv[1:]
+    if command and command[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    cfg = load_config()
+    if not command:
+        cmd_run(cfg, ["claude"])
+    elif command[0] == "--":
+        cmd_run(cfg, command[1:] or ["claude"])
+    elif command[0] == "shell" and len(command) == 1:
+        cmd_run(cfg, ["bash", "-l"])
+    elif command[0] == "stop":
+        cmd_stop(cfg)
+    elif command[0] == "status":
+        cmd_status(cfg)
+    elif command[0] == "logs":
+        cmd_logs(cfg, len(command) > 1 and command[1] == "blocked")
+    elif command[0] == "reload":
+        cmd_reload(cfg)
+    elif command[0] == "rebuild":
+        cmd_rebuild(cfg)
+    elif command[0] == "check":
+        cmd_check(cfg, command[1:])
+    else:
+        cmd_run(cfg, command)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except subprocess.CalledProcessError as e:
+        die(f"{' '.join(str(a) for a in e.cmd[:2])} failed with exit code {e.returncode}")
