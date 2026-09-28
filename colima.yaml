@@ -1,6 +1,6 @@
 # csbx: a Colima VM with one Incus container for a coding agent.
 # The container has no network interface. Its only way out is a socket to
-# Squid inside this VM, which allows GET/HEAD to the hosts in allow.txt.
+# Squid inside this VM, which allows only what policy.conf lists.
 # Setup steps are in README.md. Copy this file, do not symlink it
 # (Colima rewrites it):
 #
@@ -21,6 +21,6 @@ mounts:
   - location: ~/sandbox        # the only directory the agent works in
     mountPoint: /mnt/sandbox
     writable: true
-  - location: ~/.csbx          # this repo: squid.conf, allow.txt, profile.yaml
+  - location: ~/.csbx          # this repo: policy.conf, squid.conf, profile.yaml
     mountPoint: /mnt/csbx
     writable: false

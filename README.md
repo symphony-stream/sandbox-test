@@ -3,22 +3,21 @@
 A sandbox for a coding agent on a Mac (macOS 13+, Apple Silicon or
 Intel): Colima VM, one Incus container inside, one proxy. The container
 has no network interface at all. Its only way out is a socket to Squid
-in the VM. Squid lets through GET/HEAD to the hosts in `allow.txt`, the
-POST that git fetch needs, and anything to api.anthropic.com. So the
-agent can hold your credentials and MCP servers and read what you
-allow, but `git push` and every POST to GitLab, GitHub or anywhere else
-get a 403.
+in the VM. Squid lets through what `policy.conf` lists: GET/HEAD to some
+hosts, POST to a few URLs (git fetch), anything to api.anthropic.com. So
+the agent can hold your credentials and MCP servers and read what you
+allow, but `git push` and every other POST get a 403.
 
 ```
 Mac   ~/sandbox  (the only shared directory)      ~/.csbx  (this repo, read-only in the VM)
- └─ Colima VM "csbx"      Squid on 127.0.0.1:3128, CA key, allow.txt, access.log
+ └─ Colima VM "csbx"      Squid on 127.0.0.1:3128, CA key, policy.conf, access.log
      └─ Incus "csbx"      Debian 13, no eth0, proxy socket 127.0.0.1:3128 -> Squid
                           claude, glab, git, node 24, your MCP servers and tokens
 ```
 
-Files: `colima.yaml` the VM, `squid.conf` the policy engine, `allow.txt`
-the hosts, `profile.yaml` the container. Setup is done once by hand,
-below, in about ten minutes.
+Files: `colima.yaml` the VM, `policy.conf` what is allowed, `squid.conf`
+how the rules apply, `profile.yaml` the container. Setup is done once by
+hand, below, in about ten minutes.
 
 ## 1. Mac: the VM
 
@@ -45,8 +44,8 @@ sudo openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes -subj /CN=csbx
 sudo chown root:proxy /etc/squid/ca.pem && sudo chmod 640 /etc/squid/ca.pem
 sudo openssl x509 -in /etc/squid/ca.pem -out /etc/squid/ca.crt
 sudo /usr/lib/squid/security_file_certgen -c -s /var/spool/squid/ssl_db -M 4MB && sudo chown -R proxy:proxy /var/spool/squid/ssl_db
-sudo install -m 644 /mnt/csbx/squid.conf /mnt/csbx/allow.txt /etc/squid/
-sudo install -d /etc/squid/errors && echo 'csbx: %M %U refused (allow.txt)' | sudo tee /etc/squid/errors/ERR_ACCESS_DENIED
+sudo install -m 644 /mnt/csbx/squid.conf /mnt/csbx/policy.conf /etc/squid/
+sudo install -d /etc/squid/errors && echo 'csbx: %M %U refused (policy.conf)' | sudo tee /etc/squid/errors/ERR_ACCESS_DENIED
 sudo install -d /etc/systemd/system/squid.service.d && printf '[Service]\nRestart=on-failure\n' | sudo tee /etc/systemd/system/squid.service.d/csbx.conf
 sudo systemctl daemon-reload && sudo squid -k parse && sudo systemctl restart squid
 ```
@@ -93,7 +92,7 @@ Add to `~/.zshrc` (or `~/.bashrc`) and open a new terminal:
 ```sh
 csbx() {
   case "${1:-}" in
-    reload) colima ssh -p csbx -- sudo sh -c 'squid -k parse -f /mnt/csbx/squid.conf && install -m 644 /mnt/csbx/squid.conf /mnt/csbx/allow.txt /etc/squid/ && systemctl reload-or-restart squid' ;;
+    reload) colima ssh -p csbx -- sudo sh -c 'install -m 644 /mnt/csbx/squid.conf /mnt/csbx/policy.conf /etc/squid/ && squid -k parse && systemctl reload-or-restart squid' ;;
     log)    colima ssh -p csbx -- sudo tail -n 30 -f /var/log/squid/access.log ;;
     reset)  incus snapshot restore colima-csbx:csbx clean ;;
     *)      local h; h=$(incus exec colima-csbx:csbx -- getent passwd "$(id -u)" | cut -d: -f6)
@@ -122,8 +121,8 @@ Tokens for MCP servers go into `~/.claude/settings.json`
 servers it starts. Give the agent read-only tokens where the service has
 them: the proxy blocks writes, a scoped token blocks them twice. More
 tools: `sudo apt-get install`, `npm i -g`, `pip` in a venv all go
-through the proxy and work for hosts in `allow.txt`; anything installed
-outside `~/sandbox` and `~/.claude` is gone after `csbx reset`.
+through the proxy and work for hosts in `policy.conf`; anything
+installed outside `~/sandbox` and `~/.claude` is gone after `csbx reset`.
 
 `csbx log` shows every request URL, not headers or bodies. Refused ones
 look like `TCP_DENIED/403 POST https://gitlab.com/api/v4/...` or, for an
@@ -132,15 +131,29 @@ unlisted host, `TCP_DENIED/200 CONNECT evil.example:443` followed by a
 "Connection reset" or "Proxy CONNECT aborted" means Squid is down:
 `csbx reload`. The first request right after a reload may fail once.
 
-## Allowlist
+## Policy
 
-`allow.txt`: one host per line, `.host` for the host and all subdomains,
-GET and HEAD only. Edit it on the Mac, then `csbx reload`. Everything
-else is in `squid.conf`: the POST exceptions (`post_ok`: git fetch on
-gitlab.com/github.com, Claude Code token refresh) and the any-method
-host (`any_ok`: api.anthropic.com). To allow a POST somewhere, put the
-host in `allow.txt`, add `acl post_ok url_regex ^https://host\.example/path$`
-to `squid.conf`, `csbx reload`.
+`policy.conf` is the whole allowlist, in Squid's own syntax. Three kinds
+of lines, each may repeat; a host is exact, `.host` also covers its
+subdomains; a regex sees the whole URL, so escape the dots:
+
+```
+acl allowed dstdomain -n gitlab.com .githubusercontent.com          # GET and HEAD, any path
+acl post_ok url_regex ^https://gitlab\.com/.*/git-upload-pack$      # POST too, on these URLs
+acl any_ok  dstdomain -n api.anthropic.com                          # any method, any path
+```
+
+A `post_ok` URL needs its host in `allowed` too. Example, letting the
+agent comment on merge requests:
+
+```
+acl post_ok url_regex ^https://gitlab\.com/api/v4/projects/[^/]+/merge_requests/[0-9]+/notes$
+```
+
+Edit on the Mac, then `csbx reload`: it copies the file into the VM,
+checks it (`squid -k parse`, a typo aborts here and the old policy keeps
+running) and reloads Squid. `squid.conf` never needs editing; it says
+how the three lists apply and refuses everything else.
 
 Refused by design: `git push` (403), ssh (no network), GraphQL and
 MCP-over-HTTP (POST), `glab api graphql`, npm audit.
@@ -149,7 +162,7 @@ MCP-over-HTTP (POST), `glab api graphql`, npm audit.
 
 The container cannot reach anything but Squid, cannot reach the VM, the
 Mac or the LAN, has no DNS (Squid resolves listed hosts only), and cannot
-change the policy: `allow.txt`, `squid.conf` and the CA key live in the
+change the policy: `policy.conf`, `squid.conf` and the CA key live in the
 VM. Root inside the container changes nothing about that.
 
 Not covered: api.anthropic.com takes any request, including ones that
@@ -169,8 +182,8 @@ the diff.
 
 ## Update, stop, remove
 
-`git -C ~/.csbx pull && csbx reload` applies a new `squid.conf` or
-`allow.txt`; a new `profile.yaml` needs the `sed | incus profile edit`
+`git -C ~/.csbx pull && csbx reload` applies a new `policy.conf` or
+`squid.conf`; a new `profile.yaml` needs the `sed | incus profile edit`
 line from step 2 again; a new `colima.yaml` needs copying again and
 `colima restart csbx`. `claude update` works inside, `csbx reset` undoes
 it; to rebuild the container from scratch: `incus delete -f
