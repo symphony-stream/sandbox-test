@@ -1,0 +1,36 @@
+# csbx container profile: no network interface, one proxy socket to Squid,
+# two disks, proxy and CA settings for every process. @USER@ and @UID@ are
+# your Mac user name and uid; the README applies it with:
+#   sed "s/@USER@/$USER/g; s/@UID@/$(id -u)/g" /mnt/csbx/profile.yaml | incus profile edit csbx
+description: csbx sandbox
+config:
+  raw.idmap: both @UID@ @UID@                 # your files keep your uid inside
+  security.guestapi: "false"
+  environment.HTTP_PROXY: http://127.0.0.1:3128
+  environment.HTTPS_PROXY: http://127.0.0.1:3128
+  environment.http_proxy: http://127.0.0.1:3128
+  environment.https_proxy: http://127.0.0.1:3128
+  environment.NO_PROXY: localhost,127.0.0.1
+  environment.no_proxy: localhost,127.0.0.1
+  environment.NODE_USE_ENV_PROXY: "1"          # node fetch() through the proxy (Node 22.21+/24)
+  environment.NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt
+  environment.SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+  environment.REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+  environment.DENO_TLS_CA_STORE: system
+  environment.CLAUDE_CONFIG_DIR: /home/@USER@/.claude   # all Claude Code state on the claude disk
+  environment.GLAB_CONFIG_DIR: /home/@USER@/.claude/glab # glab token too: both survive a reset
+  environment.DISABLE_TELEMETRY: "1"           # Claude Code: no telemetry, errors, updates
+  environment.DISABLE_ERROR_REPORTING: "1"
+  environment.DISABLE_AUTOUPDATER: "1"
+  environment.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+  environment.ENABLE_CLAUDEAI_MCP_SERVERS: "false"
+  environment.GLAB_SEND_TELEMETRY: "false"
+  environment.GLAB_CHECK_UPDATE: "false"
+  environment.NPM_CONFIG_AUDIT: "false"
+  environment.NPM_CONFIG_UPDATE_NOTIFIER: "false"
+  environment.GIT_LFS_SKIP_SMUDGE: "1"
+devices:
+  root:    {type: disk, path: /, pool: default}
+  proxy:   {type: proxy, bind: instance, listen: tcp:127.0.0.1:3128, connect: tcp:127.0.0.1:3128}
+  sandbox: {type: disk, source: /mnt/sandbox, path: /home/@USER@/sandbox}
+  claude:  {type: disk, source: /var/lib/csbx/claude, path: /home/@USER@/.claude}
